@@ -1,0 +1,22 @@
+{
+  "plugins_loading": {
+    "enabled": true,
+    "search_dirs": ["./target/release"]
+  },
+  "plugins": {
+    "rest": {
+      "http_port": 8000
+    },
+    "storage_manager": {
+      "volumes": {
+        "memory": {}
+      },
+      "storages": {
+        "demo": {
+          "key_expr": "demo/example/**",
+          "volume": "memory"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Zenoh Dashboard - Phase 1</title>
+    <style>
+        /* Just some simple styling for the demo */
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            background-color: #f6f8fa; 
+            margin: 40px; 
+            line-height: 1.6;
+        }
+        h1 { color: #24292e; }
+        #data-container { 
+            background-color: #ffffff; 
+            border: 1px solid #d1d5da; 
+            padding: 16px; 
+            border-radius: 6px; 
+            margin-top: 20px;
+        }
+        pre { 
+            background-color: #f6f8fa; 
+            padding: 16px; 
+            border-radius: 6px; 
+            overflow-x: auto; /* Handle long lines */
+        }
+    </style>
+</head>
+<body>
+
+    <h1>Zenoh Dashboard - First Phase Demo</h1>
+
+    <h2>Data from Storage (<code>/demo/example/**</code>)</h2>
+
+    <div id="data-container">
+        <p>Loading data from Zenoh API at http://localhost:8000/...</p>
+    </div>
+
+    <script>
+        // This is the JavaScript that runs when the page loads.
+
+        // We create an 'async' function so we can use the 'await' keyword
+        async function fetchData() {
+
+            // Find the HTML element where we want to display the data
+            const container = document.getElementById('data-container');
+            const apiUrl = 'http://localhost:8000/demo/example/**';
+
+            try {
+                // This 'fetch' command is the JavaScript version of 'curl'.
+                // It sends an HTTP GET request to our Zenoh REST API.
+                const response = await fetch(apiUrl);
+
+                // Get the JSON data from the response
+                const data = await response.json();
+
+                // --- Success ---
+                // Clear the 'Loading...' text
+                container.innerHTML = '<p>Successfully fetched data:</p>';
+
+                // Create a 'pre' tag to display the JSON nicely
+                const pre = document.createElement('pre');
+
+                // 'JSON.stringify(data, null, 2)' formats the JSON with nice indentation
+                pre.textContent = JSON.stringify(data, null, 2); 
+
+                // Add the formatted JSON to our container
+                container.appendChild(pre);
+
+            } catch (error) {
+                // --- Failure ---
+                // If the fetch fails (e.g., zenohd isn't running)
+                console.error("Failed to fetch Zenoh data:", error);
+                container.innerHTML = `<p style="color: red;"><strong>Failed to connect to API.</strong><br>
+                    Is zenohd running with the REST plugin on port 8000?</p>
+                    <pre>${error}</pre>`;
+            }
+        }
+
+        // Run the function as soon as the page loads
+        fetchData();
+    </script>
+
+</body>
+</html>
