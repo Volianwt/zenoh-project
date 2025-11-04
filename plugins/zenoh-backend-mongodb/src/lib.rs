@@ -48,11 +48,11 @@ impl Plugin for MongoDbBackend {
             Builder::new_multi_thread()
                 .enable_all()
                 .build()
-                .map_err(|e| format!("Tokio运行时创建失败: {e}"))?,
+                .map_err(|e| format!("Failed to create Tokio runtime: {e}"))?,
         );
         let client = runtime
             .block_on(Client::with_uri_str(&uri))
-            .map_err(|e| format!("MongoDB连接失败: {e}"))?;
+            .map_err(|e| format!("Failed to connect to MongoDB: {e}"))?;
         let database = client.database(&database_name);
         Ok(Box::new(MongoDbVolume { database, runtime }))
     }
@@ -115,7 +115,7 @@ impl MongoDbStorage {
         runtime.spawn(task);
         handle
             .await
-            .map_err(|e| format!("MongoDB操作失败: {e}").into())
+            .map_err(|e| format!("MongoDB operation failed: {e}").into())
     }
 }
 
@@ -178,17 +178,17 @@ impl Storage for MongoDbStorage {
         {
             let value = document
                 .get_binary_generic("value")
-                .map_err(|e| format!("MongoDB GET读取value失败: {e}"))?
+                .map_err(|e| format!("MongoDB GET failed to read 'value': {e}"))?
                 .to_vec();
             let encoding = document
                 .get_str("encoding")
                 .map(|s| Encoding::from(s))
-                .map_err(|e| format!("MongoDB GET读取encoding失败: {e}"))?;
+                .map_err(|e| format!("MongoDB GET failed to read 'encoding': {e}"))?;
             let timestamp_str = document
                 .get_str("timestamp")
-                .map_err(|e| format!("MongoDB GET读取timestamp失败: {e}"))?;
+                .map_err(|e| format!("MongoDB GET failed to read 'timestamp': {e}"))?;
             let timestamp = Timestamp::from_str(timestamp_str)
-                .map_err(|e| format!("MongoDB GET解析timestamp失败: {}", e.cause))?;
+                .map_err(|e| format!("MongoDB GET failed to parse 'timestamp': {}", e.cause))?;
             Ok(vec![StoredData {
                 payload: value.into(),
                 encoding,
