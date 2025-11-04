@@ -1,0 +1,29 @@
+[package]
+authors = { workspace = true }
+edition = { workspace = true }
+name = "zenoh-backend-mongodb"
+publish = false
+rust-version = { workspace = true }
+version = { workspace = true }
+
+[features]
+default = ["dynamic_plugin", "zenoh/default"]
+dynamic_plugin = []
+
+[lib]
+name = "zenoh_backend_mongodb"
+crate-type = ["cdylib"]
+
+[dependencies]
+zenoh = { workspace = true, default-features = false }
+zenoh-util = { workspace = true }
+zenoh_backend_traits = { workspace = true, default-features = false }
+zenoh-plugin-trait = { workspace = true, default-features = false }
+async-trait = { workspace = true }
+mongodb = "2.8"
+tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+serde_json = { workspace = true }
+futures = { workspace = true }
+
+[package.metadata.cargo-machete]
+ignored = ["git-version"]

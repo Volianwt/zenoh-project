@@ -1,0 +1,35 @@
+{
+    "plugins_loading": {
+        "enabled": true,
+        "search_dirs": ["./target/release"]
+    },
+    "listen": {
+        "endpoints": {
+            "router": ["tcp/127.0.0.1:7447"]
+        }
+    },
+    "plugins": {
+        "storage_manager": {
+            "volumes": {
+                "mongo_volume": {
+                    "__path__": [
+                        "./target/release/libzenoh_backend_mongodb.dylib",
+                        "./target/release/libzenoh_backend_mongodb.so"
+                    ],
+                    "mongodb_uri": "mongodb+srv://maxx:123@clusterz.l3l2sxv.mongodb.net/?appName=clusterz",
+                    "database": "zenoh_project"
+                }
+            },
+            "storages": {
+                "mongo_storage": {
+                    "key_expr": "demo/mongo/**",
+                    "strip_prefix": "demo/mongo",
+                    "volume": {
+                        "id": "mongo_volume",
+                        "collection": "zenoh_data"
+                    }
+                }
+            }
+        }
+    }
+}
