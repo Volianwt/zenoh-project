@@ -1,0 +1,136 @@
+Zenoh Functional Extension Project (MongoDB Atlas Backend)
+
+This project is a fork of eclipse-zenoh/zenoh, created to implement the Phase 2 "Functional Extension" for a university course.
+
+Our primary extension is a new, high-performance storage backend plugin: zenoh-backend-mongodb.
+
+Core Extension (Phase 2: MongoDB Atlas Backend)
+
+This plugin allows the zenohd router to capture messages published to specific key expressions and persist them in real-time to a remote, cloud-based MongoDB Atlas database.
+
+Why MongoDB Atlas?
+
+Functional Extension: This is not just "another storage." The zenoh-backend-s3 plugin [cite: 1.3, 1.8] is excellent for data archival and backup, but it cannot perform real-time or complex field queries. Our MongoDB plugin (based on a document database) allows high-performance, field-based queries (e.g., find({ 'temp': { '$gt': 30 } })), elevating Zenoh to a real-time analytics platform.
+
+Distributed System: By connecting to a cloud-based Atlas database (instead of localhost), we demonstrate the true value of Zenoh as a distributed system—it can easily bridge local edge devices (z_pub) with remote cloud services (MongoDB Atlas).
+
+All of our new code is located in: plugins/zenoh-backend-mongodb/
+
+How to Run This Project (macOS)
+
+1. Install Dependencies (Prerequisites)
+
+You must have Rust and the MongoDB command-line tools installed on your machine.
+
+A) Install Rust
+
+curl --proto '=https' --tlsv1.2 -sSf [https://sh.rustup.rs](https://sh.rustup.rs) | sh
+source "$HOME/.cargo/env"
+
+
+B) Install MongoDB (Local Service & Tools):
+Even if we connect to Atlas, we need the mongosh CLI tool to verify.
+
+# 1. Install MongoDB (includes the mongosh tool)
+brew tap mongodb/brew
+brew install mongodb-community
+
+# 2. (Optional) Start the local service for local testing
+brew services start mongodb-community
+
+
+2. Configure the Plugin (Connect to Atlas)
+
+zenohd requires a configuration file to load our plugin.
+
+Log in to MongoDB Atlas:
+
+Create a free M0 cluster.
+
+In "Security" -> "Network Access", add your current IP address to the IP Access List.
+
+In "Database Access", create a database user (e.g., max_wang / 34739771).
+
+Get the Connection String:
+
+Click "Connect" -> "Drivers" to get your mongodb+srv://... connection string.
+
+Edit mongo-config.json5:
+
+Open the mongo-config.json5 file in the project root.
+
+Edit the "mongodb_uri" field, pasting your full Atlas connection string and replacing your username and password.
+
+Atlas Cloud Config Example:
+
+"mongodb_uri": "mongodb+srv://max_wang:34739771@cluster0.suwljgz.mongodb.net/?appName=Cluster0",
+"database": "zenoh_project" 
+
+
+(Note: For local testing, use "mongodb_uri": "mongodb://localhost:27017")
+
+3. Build the Project
+
+Build the zenohd router, which will automatically link our zenoh-backend-mongodb plugin.
+
+# (Run from the zenoh project root)
+# This will take a few minutes
+cargo build --release -p zenohd
+
+
+4. Run Tests (Testing)
+
+4.A Functional Test
+
+Objective: To prove the z_pub -> zenohd -> mongodb-plugin -> Cloud Atlas data pipeline is working.
+
+Terminal 1 (Start Zenohd):
+
+# Run zenohd and load your Atlas config
+./target/release/zenohd -c ./mongo-config.json5
+
+
+(Keep this terminal running. It is now connecting to MongoDB Atlas)
+
+Terminal 2 (Publish Data):
+
+# (Open a new terminal)
+# Publish a JSON message to the "demo/mongo/**" topic we are listening to
+./target/release/examples/z_pub -k "demo/mongo/test-atlas" -p "{'sensor_id': 999, 'location': 'cloud'}"
+
+
+Verification (MongoDB Compass or Atlas Website):
+
+Connect to your cloud cluster using your Atlas connection string.
+
+Open the zenoh_project database and the zenoh_data collection.
+
+Expected Result: You must be able to see the {'sensor_id': 999, 'location': 'cloud'} record you just published.
+
+4.B Non-Functional Test
+
+Objective: To test the plugin's throughput when connected to the cloud.
+
+Terminal 2 (Stress Test):
+
+# Run z_perfo (performance tool) to publish 5000 messages
+./target/release/examples/z_perfo -c -k "demo/mongo/perfo_cloud" -n 5000 -t 1000 -p 128 -m client -e "tcp/127.0.0.1:7447"
+
+
+Verification (Atlas/Compass):
+
+After z_perfo is finished, refresh your zenoh_data collection.
+
+Report Results: Check the "TOTAL DOCUMENTS" count in the collection.
+
+(Example: If the total is 4950, this shows a ~1% packet loss at 1000 msgs/sec to the cloud, which is an excellent non-functional test result.)
+
+(Completed) Phase 1: REST API Dashboard
+
+In the first phase of this project, we explored a "low-difficulty" GUI extension.
+
+Function: We used the zenoh-plugin-rest and zenoh-plugin-storage-manager plugins to expose data to an HTTP API.
+
+Implementation: We wrote index.html and index_realtime.html (no longer in the main branch) which used JavaScript (fetch) and Polling (setInterval) to create a simple, real-time dashboard.
+
+Conclusion: This exercise helped us understand the storage_manager and plugin system fundamentals, which provided the foundation for the Phase 2 zenoh-backend-mongodb development.
