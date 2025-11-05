@@ -2,7 +2,7 @@ name: MongoDB Backend Tests (Manual Mongo)
 
 on:
   push:
-    branches: [main]
+    branches: [main, test]
   pull_request:
     branches: [main]
   workflow_dispatch:
