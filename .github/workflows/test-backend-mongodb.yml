@@ -1,0 +1,58 @@
+name: Test Zenoh MongoDB Backend
+
+on:
+  push:
+    branches: [main, "test/mongodb-backend"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Run MongoDB Backend Tests
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7.0.8
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongo --eval 'db.adminCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      MONGO_URI: mongodb://localhost:27017
+
+    steps:
+      - uses: actions/checkout@v3
+
+      # Install Rust
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      # Cache Cargo registry and target
+      - name: Cache Cargo
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Build workspace
+      - name: Build Workspace
+        run: cargo build --workspace --verbose
+
+      # Run MongoDB backend tests (using the Docker service)
+      - name: Run MongoDB Integration Tests
+        run: |
+          export MONGO_URI="mongodb://localhost:27017"
+          cargo test -p zenoh-backend-mongodb -- --nocapture
