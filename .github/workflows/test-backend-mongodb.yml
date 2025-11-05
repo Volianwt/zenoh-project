@@ -1,4 +1,4 @@
-name: MongoDB Backend Tests (Manual Mongo)
+name: MongoDB Backend Tests
 
 on:
   push:
