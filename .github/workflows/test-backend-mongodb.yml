@@ -16,16 +16,25 @@ jobs:
         ports:
           - 27017:27017
         options: >-
-          --health-cmd "mongo --eval 'db.adminCommand({ping:1})'"
-          --health-interval 10s
+          --health-cmd "mongo --eval 'db.runCommand({ ping: 1 })'"
+          --health-interval 5s
           --health-timeout 5s
-          --health-retries 5
+          --health-retries 10
 
     env:
       MONGO_URI: mongodb://localhost:27017
 
     steps:
       - uses: actions/checkout@v3
+
+      - name: Wait for MongoDB
+  run: |
+    for i in {1..10}; do
+      mongo --eval 'db.runCommand({ ping: 1 })' && break
+      echo "Waiting for MongoDB..."
+      sleep 5
+    done
+
 
       # Install Rust
       - name: Install Rust
