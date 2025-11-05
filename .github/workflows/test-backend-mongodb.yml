@@ -2,7 +2,7 @@ name: Test Zenoh MongoDB Backend
 
 on:
   push:
-    branches: [main, "test/mongodb-backend"]
+    branches: [main, "test"]
   pull_request:
     branches: [main]
 
