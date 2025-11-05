@@ -14,7 +14,8 @@
                 "mongo_volume": {
                     "__path__": [
                         "./target/release/libzenoh_backend_mongodb.dylib",
-                        "./target/release/libzenoh_backend_mongodb.so"
+                        "./target/release/libzenoh_backend_mongodb.so",
+                        "./target/release/zenoh_backend_mongodb.dll"
                     ],
                     "mongodb_uri": "mongodb+srv://maxx:123@clusterz.l3l2sxv.mongodb.net/?appName=clusterz",
                     "database": "zenoh_project"

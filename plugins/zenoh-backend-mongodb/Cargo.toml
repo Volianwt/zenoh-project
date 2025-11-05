@@ -12,7 +12,7 @@ dynamic_plugin = []
 
 [lib]
 name = "zenoh_backend_mongodb"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 zenoh = { workspace = true, default-features = false }
@@ -24,6 +24,10 @@ mongodb = "2.8"
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde_json = { workspace = true }
 futures = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { version = "0.16", features = ["blocking"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [package.metadata.cargo-machete]
 ignored = ["git-version"]

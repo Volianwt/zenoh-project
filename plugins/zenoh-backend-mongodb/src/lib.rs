@@ -19,7 +19,7 @@ use zenoh_util::ffi::JsonValue;
 /// MongoDB backend main struct
 pub struct MongoDbBackend {}
 
-#[cfg(feature = "dynamic_plugin")]
+#[cfg(all(feature = "dynamic_plugin", not(test)))]
 zenoh_plugin_trait::declare_plugin!(MongoDbBackend);
 
 impl Plugin for MongoDbBackend {
