@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use futures::future::FutureExt;
 use mongodb::{
     bson::{doc, spec::BinarySubtype, Binary, Bson, Document},
+    options::ReplaceOptions,
     Client, Collection, Database,
 };
 use serde_json::json;
@@ -139,6 +140,7 @@ impl Storage for MongoDbStorage {
             Some(k) => Bson::String(k.to_string()),
             None => Bson::Null,
         };
+        let key_filter = key_bson.clone();
         let payload = value.to_bytes().into_owned();
         let value_text = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok();
         let encoding_str: Cow<'static, str> = (&encoding).into();
@@ -152,11 +154,37 @@ impl Storage for MongoDbStorage {
             document.insert("value_text", text);
         }
         let collection = self.collection.clone();
+        // Previously this was insert_one, which created duplicate rows for repeated puts of the same key (no idempotency).
+        // Now we also guard by timestamp so an older write cannot clobber a newer one.
+        let incoming_ts_str = timestamp.to_string();
         self.run_on_runtime(async move {
+            // Quick timestamp check: if an existing doc has a newer or equal ts, treat this as outdated.
+            if let Some(existing) = collection
+                .find_one(doc! { "key": key_filter.clone() }, None)
+                .await?
+            {
+                if let Some(existing_ts_str) = existing.get_str("timestamp").ok() {
+                    if let (Ok(existing_ts), Ok(incoming_ts)) =
+                        (Timestamp::from_str(existing_ts_str), Timestamp::from_str(&incoming_ts_str))
+                    {
+                        if existing_ts >= incoming_ts {
+                            return Ok(StorageInsertionResult::Outdated);
+                        }
+                    }
+                }
+            }
+
+            let options = ReplaceOptions::builder().upsert(true).build(); // Upsert(update + insert) to ensure idempotency
             collection
-                .insert_one(document, None)
+                .replace_one(doc! { "key": key_filter }, document, options)
                 .await
-                .map(|_| StorageInsertionResult::Inserted)
+                .map(|res| {
+                    if res.matched_count > 0 {
+                        StorageInsertionResult::Replaced
+                    } else {
+                        StorageInsertionResult::Inserted
+                    }
+                })
         })
         .await
     }
