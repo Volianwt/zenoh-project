@@ -48,7 +48,7 @@ fn build_storage_config(volume_id: &str) -> StorageConfig {
 }
 
 #[test]
-fn mongo_backend_round_trip() {
+fn test_put_get() {
     let docker_available = std::process::Command::new("docker")
         .arg("info")
         .output()
@@ -96,3 +96,193 @@ fn mongo_backend_round_trip() {
     assert_eq!(stored.encoding, encoding);
     assert_eq!(stored.payload, payload);
 }
+
+#[test]
+fn test_double_put() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if !docker_available {
+        eprintln!("Skipping mongo_backend_round_trip: Docker is not available.");
+        return;
+    }
+
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+
+    let volume_config = build_volume_config(&uri);
+    let storage_config = build_storage_config(&volume_config.name);
+
+    let volume = MongoDbBackend::start("mongo_volume", &volume_config)
+        .expect("backend should start");
+
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_config).await })
+        .expect("storage should be created");
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/test-key").unwrap());
+    let payload: ZBytes = "{'sensor_id':123,'temp':25.5}".into();
+    let encoding = Encoding::from("text/plain");
+    let timestamp = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a")
+        .expect("timestamp parses");
+
+    runtime.block_on(async {
+        let result = storage
+            .put(key.clone(), payload.clone(), encoding.clone(), timestamp)
+            .await
+            .expect("put should succeed");
+        assert!(matches!(result, StorageInsertionResult::Inserted));
+    });
+
+    let payload2: ZBytes = "{'sensor_id':125,'temp':26.0}".into();
+
+    runtime.block_on(async {
+        let result = storage
+            .put(key.clone(), payload.clone(), encoding.clone(), timestamp)
+            .await
+            .expect("put should succeed");
+        assert!(matches!(result, StorageInsertionResult::Inserted));
+    });
+
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .expect("get should succeed");
+
+    assert_eq!(fetched.len(), 1);
+    let stored = &fetched[0];
+    assert_eq!(stored.encoding, encoding);
+    assert_eq!(stored.payload, payload2);
+}
+
+#[test]
+fn test_get_nonexistent_key() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if !docker_available {
+        eprintln!("Skipping mongo_backend_round_trip: Docker is not available.");
+        return;
+    }
+
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+
+    let volume_config = build_volume_config(&uri);
+    let storage_config = build_storage_config(&volume_config.name);
+
+    let volume = MongoDbBackend::start("mongo_volume", &volume_config)
+        .expect("backend should start");
+
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_config).await })
+        .expect("storage should be created");
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/test-key").unwrap());
+
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .expect("get should succeed");
+
+    assert_eq!(fetched.len(), 0);
+}
+
+#[test]
+fn test_delete() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if !docker_available {
+        eprintln!("Skipping mongo_backend_round_trip: Docker is not available.");
+        return;
+    }
+
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+
+    let volume_config = build_volume_config(&uri);
+    let storage_config = build_storage_config(&volume_config.name);
+
+    let volume = MongoDbBackend::start("mongo_volume", &volume_config)
+        .expect("backend should start");
+
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_config).await })
+        .expect("storage should be created");
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/test-key").unwrap());
+    let payload: ZBytes = "{'sensor_id':123,'temp':25.5}".into();
+    let encoding = Encoding::from("text/plain");
+    let timestamp = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a")
+        .expect("timestamp parses");
+
+    runtime.block_on(async {
+        let result = storage
+            .put(key.clone(), payload.clone(), encoding.clone(), timestamp)
+            .await
+            .expect("put should succeed");
+        assert!(matches!(result, StorageInsertionResult::Inserted));
+    });
+
+    runtime.block_on(async {
+        let result = storage
+            .delete(key.clone(), timestamp)
+            .await
+            .expect("delete should succeed");
+        assert!(matches!(result, StorageInsertionResult::Deleted));
+    });
+    
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .expect("get should succeed");
+
+    assert_eq!(fetched.len(), 0);
+}
+
+#[test]
+fn test_delete_unknown_key() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if !docker_available {
+        eprintln!("Skipping mongo_backend_round_trip: Docker is not available.");
+        return;
+    }
+
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+
+    let volume_config = build_volume_config(&uri);
+    let storage_config = build_storage_config(&volume_config.name);
+
+    let volume = MongoDbBackend::start("mongo_volume", &volume_config)
+        .expect("backend should start");
+
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_config).await })
+        .expect("storage should be created");
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/test-key").unwrap());
+    let timestamp = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a")
+        .expect("timestamp parses");
+
+    runtime.block_on(async {
+        let result = storage
+            .delete(key.clone(), timestamp)
+            .await
+            .expect("delete should succeed");
+        assert!(matches!(result, StorageInsertionResult::Deleted));
+    });
+}
+
