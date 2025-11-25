@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::{Duration, Instant}};
 
 use futures::future::try_join_all;
 use mongodb::{bson::doc, Client};
@@ -154,5 +154,112 @@ fn mongo_backend_stress_puts() {
     println!(
         "mongo_backend_stress_puts: total_puts={}, workers={}, elapsed={:.2?}, throughput={:.0} puts/s",
         total_puts, workers, elapsed, puts_per_sec
+    );
+}
+
+#[test]
+#[ignore = "manual latency run; heavy and requires Docker"]
+fn mongo_backend_latency_percentiles() {
+    let docker_available = std::process::Command::new("docker")
+        .arg("info")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+
+    if !docker_available {
+        eprintln!("Skipping mongo_backend_latency_percentiles: Docker is not available.");
+        return;
+    }
+
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let volume_config = build_volume_config(&uri);
+    let collection_name = "zenoh_backend_tests_latency";
+
+    let volume = MongoDbBackend::start("mongo_volume", &volume_config)
+        .expect("backend should start");
+
+    // Focused on latency, so fewer ops than throughput test but still concurrent.
+    let workers = 20usize;
+    let total_puts = 2_000usize;
+    let per_worker = (total_puts + workers - 1) / workers;
+    let encoding = Encoding::from("text/plain");
+    let ts = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a")
+        .expect("timestamp parses");
+
+    let mut storages = Vec::with_capacity(workers);
+    for i in 0..workers {
+        let storage_cfg =
+            build_storage_config(&volume_config.name, collection_name, &format!("latency-worker-{i}"));
+        let storage = runtime
+            .block_on(async { volume.create_storage(storage_cfg).await })
+            .expect("storage should be created");
+        storages.push(storage);
+    }
+
+    let tasks = storages.into_iter().enumerate().map(|(worker_idx, mut storage)| {
+        let encoding = encoding.clone();
+        let ts = ts;
+        let start = worker_idx * per_worker;
+        let end = ((worker_idx + 1) * per_worker).min(total_puts);
+        tokio::spawn(async move {
+            let mut durations = Vec::with_capacity(end.saturating_sub(start));
+            for i in start..end {
+                let key = Some(
+                    OwnedKeyExpr::try_from(format!("demo/mongo/latency-{i}"))
+                        .expect("key_expr parses"),
+                );
+                let payload: ZBytes = format!("payload-{i}").into();
+                let put_start = Instant::now();
+                let res = storage
+                    .put(key, payload, encoding.clone(), ts)
+                    .await
+                    .expect("put should succeed");
+                durations.push(put_start.elapsed());
+                assert!(
+                    matches!(res, StorageInsertionResult::Inserted | StorageInsertionResult::Replaced),
+                    "unexpected insertion result in latency run"
+                );
+            }
+            Ok::<Vec<Duration>, String>(durations)
+        })
+    });
+
+    let worker_results = runtime
+        .block_on(async { try_join_all(tasks).await })
+        .expect("all workers should finish");
+    let mut durations: Vec<Duration> = worker_results
+        .into_iter()
+        .map(|res| res.expect("worker should succeed"))
+        .flatten()
+        .collect();
+
+    assert_eq!(durations.len(), total_puts, "all puts should be recorded");
+    durations.sort_unstable();
+    let percentile = |p: f64, data: &Vec<Duration>| -> Duration {
+        let len = data.len();
+        let rank = ((p * len as f64).ceil().max(1.0) as usize).saturating_sub(1);
+        data[rank.min(len - 1)]
+    };
+
+    let p50 = percentile(0.50, &durations);
+    let p95 = percentile(0.95, &durations);
+    let p99 = percentile(0.99, &durations);
+
+    // Soft guard: keep p95 under 20ms, p99 under 30ms on typical dev hardware.
+    assert!(
+        p95 < Duration::from_millis(20),
+        "p95 latency too high: {:.2?}",
+        p95
+    );
+    assert!(
+        p99 < Duration::from_millis(30),
+        "p99 latency too high: {:.2?}",
+        p99
+    );
+
+    println!(
+        "mongo_backend_latency_percentiles: total_puts={}, workers={}, p50={:.2?}, p95={:.2?}, p99={:.2?}",
+        total_puts, workers, p50, p95, p99
     );
 }
