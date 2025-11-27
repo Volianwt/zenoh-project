@@ -1,51 +1,141 @@
-<img src="https://raw.githubusercontent.com/eclipse-zenoh/zenoh/master/zenoh-dragon.png" height="150">
+Here is a complete, professional README.md file in English, tailored specifically to your project's architecture and implementation details.
 
-# Eclipse Zenoh
+You can copy and paste this directly into your project folder.
 
-Eclipse Zenoh: Zero Overhead Pub/Sub, Store/Query and Compute.
+Zenoh Storage Backend for MongoDB
+An efficient, robust storage plugin for Zenoh that persists data into MongoDB.
 
-Zenoh (pronounce _/zeno/_) unifies data in motion, data at rest and computations. It carefully blends traditional pub/sub with geo-distributed storages, queries and computations, while retaining a level of time and space efficiency that is well beyond any of the mainstream stacks.
+This project implements the zenoh-backend-traits interface, acting as a bridge between the high-performance Zenoh network and MongoDB's document storage. It is designed to handle distributed data consistency, unstructured payloads, and high-concurrency scenarios.
 
-Check the website [zenoh.io](http://zenoh.io) for more information and [installation instructions](https://zenoh.io/docs/getting-started/installation/)
+🏗 Architecture
+This plugin strictly follows Zenoh's 3-Layer Storage Architecture, ensuring resource efficiency and separation of concerns:
 
-See also the [roadmap](https://github.com/eclipse-zenoh/roadmap) for more detailed technical information.
+1. Backend Layer (MongoDbBackend)
+Role: The Factory & Runtime Manager.
 
-# Contents
+Function: Initializes the plugin and spins up a dedicated Tokio Runtime (Arc<Runtime>).
 
-- [zenoh-plugin-trait](zenoh-plugin-trait)
+Why: Zenoh uses its own runtime for routing. We create an isolated Tokio runtime to support the MongoDB driver's async requirements without blocking Zenoh's main threads.
 
-  The zenoh plugin [API](https://docs.rs/zenoh-plugin-trait/latest/zenoh_plugin_trait/).
+2. Volume Layer (MongoDbVolume)
+Role: The Resource Holder.
 
-  This crate introduces a common plugin library which provides:
-  - the API to implement plugins
-  - the API to load, start, and stop plugins and get their status
+Function: Manages the connection pool (Client) to a specific MongoDB Database.
 
-  The application-specific, functional part of plugins is implemented outside of this API, in the types passed as type
-  arguments `StartArgs` and `Instance`.
-  For example, the plugins for `zenohd` should implement the trait `ZenohPlugin` from the `zenoh` crate (under the `internal` feature) with
-  `DynamicRuntime` and `RunningPlugin` types provided by `zenoh`.
+Capability: Supports defining multiple Volumes in the configuration to connect to different databases (e.g., Production vs. Test) simultaneously.
 
-  ```rust
-  pub trait ZenohPlugin: Plugin<StartArgs = DynamicRuntime, Instance = RunningPlugin> {}
-  ```
+3. Storage Layer (MongoDbStorage)
+Role: The Executor.
 
-- [zenoh-plugin-example](zenoh-plugin-example)
+Function: Handles the actual CRUD operations (put, get, delete) on a specific MongoDB Collection. It receives the database connection handle from the Volume layer upon creation.
 
-  A simple example plugin for `zenohd`
+🚀 Key Features
+Idempotency & Upserts: Uses replace_one with upsert=true. Repeated writes of the same key result in a single record, preventing duplicate data entries.
 
-- [zenoh-plugin-rest](zenoh-plugin-rest)
+Conflict Resolution (LWW): Implements Last-Write-Wins. The plugin compares the incoming Zenoh timestamp with the stored timestamp. Older messages arriving late (due to network latency) are rejected (StorageInsertionResult::Outdated) to preserve data consistency.
 
-  The plugin implementing the [REST API](https://zenoh.io/docs/apis/rest/) for `zenohd`.
+Hybrid Data Storage:
 
-- [zenoh-plugin-storage-manager](zenoh-plugin-storage-manager)
+Binary: Stores the raw payload as BSON Binary (supports images, protobuf, etc.).
 
-  The plugin which allows connecting `zenohd` to different storages (e.g., databases). This plugin is a plugin manager itself which loads its own plugins - `backends` -
-  specific for external storage APIs.
+Text Metadata: Automatically attempts to decode UTF-8 strings and stores them in a value_text field for human readability in MongoDB Compass/Atlas.
 
-- [zenoh-backend-traits](zenoh-backend-traits)
+Performance Metrics: Includes integration tests for throughput (puts/sec) and latency percentiles (P95/P99).
 
-  The backend API for the storage manager. It exports types `VolumeConfig` and `VolumeInstance` which are used by backends as the `Plugin` trait's type arguments.
+🛠 Tech Stack
+Language: Rust (Safe, Fast, Native to Zenoh)
 
-- [zenoh-backend-example](zenoh-backend-example)
+Database: MongoDB (Flexible JSON/BSON document storage)
 
-  A simple example backend plugin for `zenoh-plugin-storage-manager`
+Async Runtime: Tokio (Industry-standard async runtime for Rust)
+
+Containerization: testcontainers (For robust integration testing)
+
+⚙️ Configuration
+To use this plugin, add it to your zenoh.json5 configuration file.
+
+Code snippet
+
+{
+  plugins: {
+    // Register the storage manager
+    storage_manager: {
+      storages: {
+        // Define your storage instance
+        "my-mongo-storage": {
+          // 1. Key Expression: Only data matching this path will be stored
+          key_expr: "demo/mongo/**",
+          
+          // 2. Volume Configuration
+          volume: {
+            id: "my-atlas-vol",
+            factory: "mongodb_backend", // Must match the plugin name
+            
+            // Backend/Volume settings passed to your Rust code
+            mongodb_uri: "mongodb+srv://<user>:<pass>@cluster.mongodb.net/?w=majority",
+            database: "zenoh_app_db",
+            collection: "sensor_data"
+          }
+        }
+      }
+    }
+  }
+}
+🏃 Usage Guide
+1. Build the Plugin
+Bash
+
+cargo build --release
+2. Start Zenoh Router
+Run zenohd pointing to your configuration file:
+
+Bash
+
+zenohd -c zenoh.json5
+3. Interact via CLI
+You can use the standard Zenoh CLI tools (z_put, z_get, z_delete) to interact with the database.
+
+Store Data (Put):
+
+Bash
+
+z_put demo/mongo/sensor/temp "{'val': 23.5, 'unit': 'C'}"
+Result: A document is created (or updated) in MongoDB with the payload and timestamp.
+
+Retrieve Data (Get):
+
+Bash
+
+z_get demo/mongo/sensor/temp
+Result: Zenoh fetches the latest data directly from MongoDB.
+
+Delete Data:
+
+Bash
+
+z_delete demo/mongo/sensor/temp
+Result: The document is removed from the MongoDB collection.
+
+🧪 Testing
+This project uses testcontainers for real integration testing (not mocks).
+
+Run Functional Tests
+Verifies Put, Get, Delete, Idempotency, and Timestamp logic:
+
+Bash
+
+cargo test
+Run Performance Benchmarks
+To run the Stress (Throughput) and Latency (P99) tests (requires Docker):
+
+Bash
+
+cargo test -- --ignored
+Stress Test: Simulates 50 concurrent workers sending 10,000 messages.
+
+Latency Test: Calculates P50, P95, and P99 latency percentiles to ensure responsiveness.
+
+📂 Project Structure
+src/lib.rs: Main library file containing MongoDbBackend, MongoDbVolume, and MongoDbStorage implementations.
+
+tests/: Integration tests using Docker containers.
