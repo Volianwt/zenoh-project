@@ -1,9 +1,13 @@
 # 🍃 Zenoh Storage Backend for MongoDB
+## 🔗 Project Location
 
-![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)
-![Zenoh](https://img.shields.io/badge/zenoh-v1.0.0-blue)
-![MongoDB](https://img.shields.io/badge/MongoDB-v7.0-green)
-![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
+**The core implementation for this course project is located in the following directory:**
+
+👉 [**plugins/zenoh-backend-mongodb**](/plugins/zenoh-backend-mongodb)
+
+> *Note: This directory contains the complete source code (`src/`), integration tests (`tests/`), and build configurations (`Cargo.toml`) developed by our team.*
+
+---
 
 > **A high-performance, robust storage plugin that bridges [Zenoh](https://zenoh.io/) with MongoDB.**
 
