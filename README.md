@@ -1,137 +1,173 @@
-<img src="https://raw.githubusercontent.com/eclipse-zenoh/zenoh/master/zenoh-dragon.png" height="150">
+# 🍃 Zenoh Storage Backend for MongoDB
 
-[![CI](https://github.com/eclipse-zenoh/zenoh/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/eclipse-zenoh/zenoh/actions?query=workflow%3ACI+branch%3Amain++)
-[![Documentation Status](https://readthedocs.org/projects/zenoh-rust/badge/?version=latest)](https://zenoh-rust.readthedocs.io/en/latest/?badge=latest)
-[![codecov](https://codecov.io/github/eclipse-zenoh/zenoh/branch/main/graph/badge.svg?token=F8T4C8WPZD)](https://codecov.io/github/eclipse-zenoh/zenoh)
-[![Discussion](https://img.shields.io/badge/discussion-on%20github-blue)](https://github.com/eclipse-zenoh/roadmap/discussions)
-[![Discord](https://img.shields.io/badge/chat-on%20discord-blue)](https://discord.gg/2GJ958VuHs)
-[![License](https://img.shields.io/badge/License-EPL%202.0-blue)](https://choosealicense.com/licenses/epl-2.0/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+![Rust](https://img.shields.io/badge/rust-stable-brightgreen.svg)
+![Zenoh](https://img.shields.io/badge/zenoh-v1.0.0-blue)
+![MongoDB](https://img.shields.io/badge/MongoDB-v7.0-green)
+![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
 
-# Eclipse Zenoh
+> **A high-performance, robust storage plugin that bridges [Zenoh](https://zenoh.io/) with MongoDB.**
 
-Eclipse Zenoh: Zero Overhead Pub/Sub, Store/Query and Compute.
+This plugin enables seamless data persistence for Zenoh applications, leveraging MongoDB's document structure to store unstructured IoT data with industrial-grade reliability.
 
-Zenoh (pronounced _/zeno/_) unifies data in motion, data at rest, and computations. It carefully blends traditional pub/sub with geo-distributed storage, queries, and computations, while retaining a level of time and space efficiency that is well beyond any of the mainstream stacks.
+---
 
-Check the website [zenoh.io](http://zenoh.io) for more information and [installation instructions](https://zenoh.io/docs/getting-started/installation/).
+## 📖 Overview
 
-See also the [roadmap](https://github.com/eclipse-zenoh/roadmap) for more detailed technical information.
+This project implements a **Storage Backend Plugin** for the Zenoh network protocol. It allows Zenoh to persist data (Key-Value pairs) directly into MongoDB collections and retrieve them transparently.
 
-# Structure of the Repository
+Built using **Rust**, **Tokio**, and the official **MongoDB Async Driver**, this plugin is designed for distributed systems requiring eventual consistency, high throughput, and unstructured data storage.
 
-This repository contains the following elements:
+---
 
-* [zenoh](zenoh) Rust crate
+## 🏗 Architecture
 
-  This crate is the primary and reference implementation of the Zenoh protocol. The Zenoh libraries for other languages
-  are bindings to this Rust implementation, except for the pure-C
-  [zenoh-pico](https://github.com/eclipse-zenoh/zenoh-pico) (see the "Language Support" section below).
+This plugin strictly adheres to Zenoh's **3-Layer Storage Architecture**, ensuring separation of concerns and efficient resource management:
 
-* [zenoh-ext](zenoh-ext) Rust crate
+| Layer | Component | Responsibility |
+| :--- | :--- | :--- |
+| **1. Backend** | `MongoDbBackend` | **The Factory:** Initializes the plugin and spins up a dedicated **Tokio Runtime** to isolate database I/O from Zenoh's main routing threads. |
+| **2. Volume** | `MongoDbVolume` | **The Connector:** Manages the connection pool (`Client`) to a specific MongoDB Database. Supports multiple volume instances for connecting to different DBs simultaneously. |
+| **3. Storage** | `MongoDbStorage` | **The Worker:** Handles the actual CRUD operations (`put`, `get`, `delete`) on a specific Collection, enforcing data consistency rules. |
 
-  This crate contains extended components of Zenoh:
-  * `AdvancedPublisher` / `AdvancedSubscriber` - APIs for sending/receiving data with advanced delivery guarantees.
-  * Data serialization support. This serialization is lightweight and universal for all `zenoh` bindings, which simplifies interoperability.
+---
 
-* [zenohd](zenohd) router binary
+## 🚀 Key Features
 
-  The Zenoh router is a standalone daemon used to support Zenoh network infrastructure.
+### 🛡️ Distributed Consistency (Last-Write-Wins)
+The plugin implements **LWW (Last-Write-Wins)** logic. It compares the incoming Zenoh timestamp with the stored document's timestamp. Older messages arriving late due to network latency are **rejected** to ensure the database always reflects the latest state.
 
-* [plugins](plugins)
+### 🔄 Idempotency
+Write operations use `replace_one` with `upsert=true`. This guarantees that publishing the same message multiple times results in a **single, consistent record** in the database, preventing duplicates.
 
-  The crates related to plugin support in `zenohd`.
+### 📦 Hybrid Data Storage
+* **Binary Payload:** Stores the raw Zenoh payload as BSON Binary (supports images, protobuf, etc.).
+* **Smart Metadata:** Automatically attempts to decode UTF-8 payloads and stores them in a `value_text` field, making data human-readable in MongoDB Compass or Atlas.
 
-* [commons](commons)
+### ⚡ Async Performance
+Powered by a **dedicated Tokio Runtime**, ensuring that heavy database operations do not block the Zenoh router's critical path/event loop.
 
-  The internal crates used by `zenoh`. These crates are not intended to be imported directly, and their public APIs can be changed at any time.
-  Stable APIs are provided by `zenoh` and `zenoh-ext` only.
+---
 
-* [examples](examples)
+## 🛠 Tech Stack
 
-  Zenoh usage examples. These examples have a double purpose: they not only demonstrate writing Zenoh applications in Rust but also serve as a set of tools for experimenting with and testing Zenoh functionality.
+* **Language:** Rust 🦀
+* **Framework:** Zenoh Backend Traits
+* **Database:** MongoDB (Official `mongodb` crate)
+* **Runtime:** Tokio (Async/Await)
+* **Testing:** Testcontainers (Docker-based integration tests)
 
-# Documentation
+---
 
-* [Docs.rs for Zenoh](https://docs.rs/zenoh/latest/zenoh/)
+## 📋 Prerequisites
 
-* [Docs.rs for Zenoh-ext](https://docs.rs/zenoh/latest/zenoh-ext/)
+Before running the plugin, ensure you have the following installed:
 
-# Build and run
+* **Rust Toolchain:** (Latest stable)
+* **Zenoh Router (`zenohd`):** Compatible version.
+* **Docker:** Required for running integration tests.
+* **MongoDB:** A running instance (Local or Atlas).
 
-Install [Cargo and Rust](https://doc.rust-lang.org/cargo/getting-started/installation.html).
-If you already have the Rust toolchain installed, make sure it is up to date with:
+---
 
+## ⚙️ Build & Installation
+
+### 1. Clone the Repository
 ```bash
-rustup update
-```
+git clone [https://github.com/Volianwt/zenoh-project.git](https://github.com/Volianwt/zenoh-project.git)
+cd zenoh-project/plugins/zenoh-backend-mongodb
+2. Build the Plugin
+Compile the project in release mode to generate the dynamic library (.so on Linux, .dylib on macOS, .dll on Windows).
 
-Zenoh can be successfully compiled with Rust stable (>= 1.75.0), but some of its dependencies may require
-newer Rust versions. The `zenoh` crate itself doesn't lock its dependencies with "=" to avoid conflicts.
-Instead, we provide the [zenoh-pinned-deps-1-75](commons/zenoh-pinned-deps-1-75) crate
-with `zenoh` dependencies locked to Rust 1.75-compatible versions.
+Bash
 
-To build Zenoh, simply type the command below after having followed the previous instructions:
+cargo build --release
+3. Locate the Library
+After building, the library will be located in the target directory (relative to the plugin root):
 
-```bash
-cargo build --release --all-targets
-```
+Linux: ../../target/release/libzenoh_backend_mongodb.so
 
-There are multiple features in `zenoh`; see the full list and descriptions on [docs.rs](https://docs.rs/zenoh/latest/zenoh/). For example, to
-use shared memory, it must be explicitly enabled:
+MacOS: ../../target/release/libzenoh_backend_mongodb.dylib
 
-```toml
-zenoh = {version = "1.5.1", features = ["shared-memory"]}
-```
+📝 Configuration
+To use this plugin, you must configure zenohd to load it. Add the following to your zenoh.json5 configuration file:
 
-## Examples
+Code snippet
 
-[Examples](examples) can be executed with Cargo, or directly from `target/release/examples`. When running with Cargo, use `--` to pass command line arguments to the examples:
+{
+  plugins: {
+    // 1. Register the Storage Manager
+    storage_manager: {
+      storages: {
+        // 2. Define your Storage Instance
+        "my-mongo-storage": {
+          // Data matching this pattern will be stored in MongoDB
+          key_expr: "demo/mongo/**",
+          
+          // 3. Configure the Volume
+          volume: {
+            id: "my-atlas-vol",
+            factory: "mongodb_backend", // Must match the plugin name
+            
+            // Connection Settings passed to the Rust Backend
+            // Replace with your actual connection string
+            mongodb_uri: "mongodb+srv://<user>:<password>@cluster.mongodb.net/?retryWrites=true&w=majority",
+            database: "zenoh_app_db",
+            collection: "sensor_data"
+          }
+        }
+      }
+    }
+  }
+}
+🏃 Usage Example
+1. Start Zenoh Router
+Start the router, pointing to your config file. You may need to specify the plugin directory using the -l flag if it's not in the system path.
 
-### Publish/Subscribe
+Bash
 
-```bash
-cargo run --example z_sub
-```
+# Example assuming you are in the project root
+zenohd -c zenoh.json5 -l target/release
+2. Publish Data (Put)
+Use the Zenoh CLI or any client to send data.
 
-```bash
-cargo run --example z_pub
-```
+Bash
 
-### Query/Reply
+z_put demo/mongo/home/temp "{'value': 23.5, 'unit': 'C'}"
+Effect: A document is upserted into MongoDB. If the key exists, it updates only if the new timestamp is newer.
 
-```bash
-cargo run --example z_queryable
-```
+3. Query Data (Get)
+Retrieve the data back from storage.
 
-```bash
-cargo run --example z_get
-```
+Bash
 
-## Zenohd Router and Plugins
+z_get demo/mongo/home/temp
+Effect: Zenoh fetches the payload directly from MongoDB and returns it.
 
-The [zenohd](zenohd) router can be run with the command `cargo run` or from `target/release/zenohd`. When running with Cargo, use `--` to pass command line arguments to `zenohd`:
+4. Delete Data
+Remove the key from storage.
 
-```bash
-cargo run -- --config DEFAULT_CONFIG.json5
-```
+Bash
 
-The router's purpose is to support Zenoh network infrastructure and provide additional services using [plugins](plugins).
-See more details and a directory of available plugins in the [zenohd](zenohd) readme.
+z_delete demo/mongo/home/temp
+Effect: The document is physically removed from the collection.
 
-# Language Support
+🧪 Testing Strategy
+This project includes a comprehensive integration test suite using Testcontainers.
 
-* **Rust** - this repository
-* **C** - there are two implementations with the same API:
-  * [zenoh-c](https://github.com/eclipse-zenoh/zenoh-c) - Rust library binding
-  * [zenoh-pico](https://github.com/eclipse-zenoh/zenoh-pico) - pure C implementation
-* **C++** - [zenoh-cpp](https://github.com/eclipse-zenoh/zenoh-cpp) - C++ wrapper over C libraries
-* **Python** - [zenoh-python](https://github.com/eclipse-zenoh/zenoh-python)
-* **Kotlin** - [zenoh-kotlin](https://github.com/eclipse-zenoh/zenoh-kotlin)
-* **Java** - [zenoh-java](https://github.com/eclipse-zenoh/zenoh-java)
-* **TypeScript** - [zenoh-ts](https://github.com/eclipse-zenoh/zenoh-ts) - WebSocket client for the plugin in [zenohd](zenohd)
+Functional Tests
+Verifies CRUD operations, UTF-8 handling, and Timestamp (LWW) logic.
 
-# Troubleshooting
+Bash
 
-In case of trouble, please first check [this page](https://zenoh.io/docs/getting-started/troubleshooting/) to see if the issue and its cause are already known.
-Otherwise, you can ask a question on the [Zenoh Discord server](https://discord.gg/vSDSpqnbkm), or [create an issue](https://github.com/eclipse-zenoh/zenoh/issues).
+cargo test
+Performance Benchmarks
+Runs Stress (Throughput) and Latency (P99) tests.
+
+⚠️ Note: These tests spawn a real MongoDB container via Docker and simulate high load.
+
+Bash
+
+cargo test -- --ignored
+Stress Test: Simulates 50 concurrent workers flooding the database.
+
+Latency Test: Measures P95 and P99 latency percentiles to ensure responsiveness.
