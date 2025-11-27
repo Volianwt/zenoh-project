@@ -1,6 +1,4 @@
-Here is a complete, professional README.md file in English, tailored specifically to your project's architecture and implementation details.
 
-You can copy and paste this directly into your project folder.
 
 Zenoh Storage Backend for MongoDB
 An efficient, robust storage plugin for Zenoh that persists data into MongoDB.
