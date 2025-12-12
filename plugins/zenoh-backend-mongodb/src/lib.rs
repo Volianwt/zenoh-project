@@ -1,12 +1,20 @@
 use async_trait::async_trait;
-use futures::future::FutureExt;
+use futures::{future::FutureExt, StreamExt};
 use mongodb::{
-    bson::{doc, spec::BinarySubtype, Binary, Bson, Document},
-    options::ReplaceOptions,
+    bson::{doc, spec::BinarySubtype, Binary, Bson, DateTime, Document, Regex},
+    options::{FindOptions, ReplaceOptions},
     Client, Collection, Database,
 };
+use regex as re;
 use serde_json::json;
-use std::{borrow::Cow, str::FromStr, sync::Arc};
+use std::{
+    borrow::Cow,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc,
+    },
+};
 use tokio::runtime::{Builder, Runtime};
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::key_expr::OwnedKeyExpr;
@@ -88,12 +96,9 @@ impl Volume for MongoDbVolume {
                 collection_name = name.clone();
             }
         }
-        let collection = self.database.collection::<Document>(&collection_name);
-        Ok(Box::new(MongoDbStorage {
-            collection,
-            collection_name,
-            runtime: self.runtime.clone(),
-        }))
+        let storage =
+            MongoDbStorage::new(&self.database, &collection_name, self.runtime.clone());
+        Ok(Box::new(storage))
     }
 }
 
@@ -103,9 +108,26 @@ pub struct MongoDbStorage {
     collection: Collection<Document>,
     collection_name: String,
     runtime: Arc<Runtime>,
+    wal_collection: Collection<Document>,
+    wal_seq: Arc<AtomicI64>,
 }
 
 impl MongoDbStorage {
+    pub fn new(database: &Database, collection_name: &str, runtime: Arc<Runtime>) -> Self {
+        let collection = database.collection::<Document>(collection_name);
+        let wal_collection = database.collection::<Document>("wal_log");
+        let wal_seq_start = runtime
+            .block_on(async { wal_collection.estimated_document_count(None).await })
+            .unwrap_or(0) as i64;
+        MongoDbStorage {
+            collection,
+            collection_name: collection_name.to_string(),
+            runtime,
+            wal_collection,
+            wal_seq: Arc::new(AtomicI64::new(wal_seq_start)),
+        }
+    }
+
     async fn run_on_runtime<F, T>(&self, fut: F) -> ZResult<T>
     where
         F: std::future::Future<Output = mongodb::error::Result<T>> + Send + 'static,
@@ -117,6 +139,164 @@ impl MongoDbStorage {
         handle
             .await
             .map_err(|e| format!("MongoDB operation failed: {e}").into())
+    }
+
+    fn timestamp_to_i64(ts: &Timestamp) -> i64 {
+        let text = ts.to_string();
+        if let Some(num) = text.split('/').next() {
+            num.parse::<i64>().unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn build_regex_from_prefix(prefix: &str) -> Regex {
+        let escaped = re::escape(prefix);
+        let pattern = escaped.replace("\\*\\*", ".*");
+        Regex {
+            pattern: format!("^{pattern}"),
+            options: "i".into(),
+        }
+    }
+
+    fn owned_key_from_bson(b: &Bson) -> Option<OwnedKeyExpr> {
+        match b {
+            Bson::String(s) => OwnedKeyExpr::try_from(s.as_str()).ok(),
+            _ => None,
+        }
+    }
+
+    async fn append_wal(
+        &self,
+        op: &str,
+        key: &Option<OwnedKeyExpr>,
+        ts: &Timestamp,
+        payload: Option<&[u8]>,
+        enc: Option<&str>,
+    ) -> ZResult<()> {
+        let seq_id = self.wal_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let key_str = key.as_ref().map(|k| k.to_string()).unwrap_or_default();
+        let payload_size = payload.map(|p| p.len() as i64).unwrap_or(0);
+        let ts_raw = Self::timestamp_to_i64(ts);
+        let ts_string = ts.to_string();
+        let wal_collection = self.wal_collection.clone();
+        let op_owned = op.to_string();
+        let enc_owned = enc.map(|e| e.to_string());
+        self.run_on_runtime(async move {
+            wal_collection
+                .insert_one(
+                    doc! {
+                        "seq_id": seq_id,
+                        "op": op_owned,
+                        "key_expr": key_str,
+                        "timestamp": ts_string,
+                        "timestamp_raw": ts_raw,
+                        "payload_size": payload_size,
+                        "encoding": enc_owned,
+                        "created_at": DateTime::now(),
+                    },
+                    None,
+                )
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn enumerate(&self, key_expr: &str) -> ZResult<Vec<StorageEntry>> {
+        self.enumerate_internal(key_expr, None, None, None).await
+    }
+
+    pub async fn enumerate_range(
+        &self,
+        key_expr: &str,
+        from_ts: Option<Timestamp>,
+        to_ts: Option<Timestamp>,
+    ) -> ZResult<Vec<StorageEntry>> {
+        self.enumerate_internal(key_expr, from_ts, to_ts, None).await
+    }
+
+    pub async fn enumerate_paged(
+        &self,
+        key_expr: &str,
+        page: PageRequest,
+    ) -> ZResult<Vec<StorageEntry>> {
+        self.enumerate_internal(
+            key_expr,
+            None,
+            None,
+            Some((page.limit as i64, page.offset as i64)),
+        )
+        .await
+    }
+
+    async fn enumerate_internal(
+        &self,
+        key_expr: &str,
+        from_ts: Option<Timestamp>,
+        to_ts: Option<Timestamp>,
+        paging: Option<(i64, i64)>,
+    ) -> ZResult<Vec<StorageEntry>> {
+        let regex = Self::build_regex_from_prefix(key_expr);
+        let mut filter = doc! { "key": { "$regex": regex } };
+        if from_ts.is_some() || to_ts.is_some() {
+            let mut ts_filter = doc! {};
+            if let Some(f) = from_ts {
+                ts_filter.insert("$gte", Self::timestamp_to_i64(&f));
+            }
+            if let Some(t) = to_ts {
+                ts_filter.insert("$lte", Self::timestamp_to_i64(&t));
+            }
+            filter.insert("timestamp_raw", ts_filter);
+        }
+
+        let mut opts = FindOptions::builder()
+            .sort(doc! { "timestamp_raw": -1 })
+            .build();
+        if let Some((limit, offset)) = paging {
+            opts.limit = Some(limit);
+            opts.skip = Some(offset as u64);
+        }
+
+        let collection = self.collection.clone();
+        let docs = self
+            .run_on_runtime(async move {
+                let mut cursor = collection.find(filter, opts).await?;
+                let mut out = Vec::new();
+                while let Some(doc) = cursor.next().await.transpose()? {
+                    out.push(doc);
+                }
+                Ok(out)
+            })
+            .await?;
+
+        docs.into_iter()
+            .map(|document| {
+                let key_bson = document
+                    .get("key")
+                    .ok_or_else(|| "MongoDB enumerate missing 'key'".to_string())?;
+                let key = Self::owned_key_from_bson(key_bson);
+                let value = document
+                    .get_binary_generic("value")
+                    .map_err(|e| format!("MongoDB enumerate failed to read 'value': {e}"))?
+                    .to_vec();
+                let encoding = document
+                    .get_str("encoding")
+                    .map(|s| Encoding::from(s))
+                    .map_err(|e| format!("MongoDB enumerate failed to read 'encoding': {e}"))?;
+                let ts_str = document
+                    .get_str("timestamp")
+                    .map_err(|e| format!("MongoDB enumerate failed to read 'timestamp': {e}"))?;
+                let timestamp = Timestamp::from_str(ts_str)
+                    .map_err(|e| format!("MongoDB enumerate failed to parse 'timestamp': {}", e.cause))?;
+                Ok(StorageEntry {
+                    key,
+                    payload: value.into(),
+                    encoding,
+                    timestamp,
+                })
+            })
+            .collect()
     }
 }
 
@@ -137,7 +317,7 @@ impl Storage for MongoDbStorage {
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
         let key_bson = match key {
-            Some(k) => Bson::String(k.to_string()),
+            Some(ref k) => Bson::String(k.to_string()),
             None => Bson::Null,
         };
         let key_filter = key_bson.clone();
@@ -149,14 +329,15 @@ impl Storage for MongoDbStorage {
             "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
             "encoding": encoding_str.as_ref(),
             "timestamp": timestamp.to_string(),
+            "timestamp_raw": Self::timestamp_to_i64(&timestamp),
         };
         if let Some(text) = value_text {
             document.insert("value_text", text);
         }
         let collection = self.collection.clone();
-        // Previously this was insert_one, which created duplicate rows for repeated puts of the same key (no idempotency).
-        // Now we also guard by timestamp so an older write cannot clobber a newer one.
         let incoming_ts_str = timestamp.to_string();
+        self.append_wal("PUT", &key, &timestamp, Some(&payload), Some(encoding_str.as_ref()))
+            .await?;
         self.run_on_runtime(async move {
             // Quick timestamp check: if an existing doc has a newer or equal ts, treat this as outdated.
             if let Some(existing) = collection
@@ -174,7 +355,7 @@ impl Storage for MongoDbStorage {
                 }
             }
 
-            let options = ReplaceOptions::builder().upsert(true).build(); // Upsert(update + insert) to ensure idempotency
+            let options = ReplaceOptions::builder().upsert(true).build(); // Upsert to ensure idempotency
             collection
                 .replace_one(doc! { "key": key_filter }, document, options)
                 .await
@@ -230,14 +411,16 @@ impl Storage for MongoDbStorage {
     async fn delete(
         &mut self,
         key: Option<OwnedKeyExpr>,
-        _timestamp: Timestamp,
+        timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
         let key_bson = match key {
-            Some(k) => Bson::String(k.to_string()),
+            Some(ref k) => Bson::String(k.to_string()),
             None => Bson::Null,
         };
         let filter = doc! { "key": key_bson };
         let collection = self.collection.clone();
+        self.append_wal("DELETE", &key, &timestamp, None, None)
+            .await?;
         self.run_on_runtime(async move {
             collection
                 .delete_one(filter, None)
@@ -248,6 +431,52 @@ impl Storage for MongoDbStorage {
     }
 
     async fn get_all_entries(&self) -> ZResult<Vec<(Option<OwnedKeyExpr>, Timestamp)>> {
-        Ok(vec![]) // Placeholder: could be extended to iterate all documents
+        let collection = self.collection.clone();
+        let docs = self
+            .run_on_runtime(async move {
+                let mut cursor = collection
+                    .find(
+                        doc! {},
+                        FindOptions::builder()
+                            .projection(doc! { "key": 1, "timestamp": 1 })
+                            .build(),
+                    )
+                    .await?;
+                let mut out = Vec::new();
+                while let Some(doc) = cursor.next().await.transpose()? {
+                    out.push(doc);
+                }
+                Ok(out)
+            })
+            .await?;
+
+        docs.into_iter()
+            .map(|document| {
+                let key_bson = document
+                    .get("key")
+                    .ok_or_else(|| "MongoDB get_all_entries missing 'key'".to_string())?;
+                let key = Self::owned_key_from_bson(key_bson);
+                let ts_str = document
+                    .get_str("timestamp")
+                    .map_err(|e| format!("MongoDB get_all_entries failed to read 'timestamp': {e}"))?;
+                let timestamp = Timestamp::from_str(ts_str)
+                    .map_err(|e| format!("MongoDB get_all_entries failed to parse 'timestamp': {}", e.cause))?;
+                Ok((key, timestamp))
+            })
+            .collect()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageEntry {
+    pub key: Option<OwnedKeyExpr>,
+    pub payload: ZBytes,
+    pub encoding: Encoding,
+    pub timestamp: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PageRequest {
+    pub limit: u32,
+    pub offset: u32,
 }

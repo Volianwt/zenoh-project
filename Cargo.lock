@@ -6805,8 +6805,10 @@ name = "zenoh-backend-mongodb"
 version = "1.6.1"
 dependencies = [
  "async-trait",
+ "criterion",
  "futures",
  "mongodb",
+ "regex",
  "serde_json",
  "testcontainers",
  "tokio",
