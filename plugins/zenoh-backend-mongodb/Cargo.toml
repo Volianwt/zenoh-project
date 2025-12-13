@@ -33,3 +33,7 @@ criterion = "0.5"
 
 [package.metadata.cargo-machete]
 ignored = ["git-version"]
+
+[[bench]]
+name = "mongodb_bench"
+harness = false

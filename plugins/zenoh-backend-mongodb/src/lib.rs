@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use futures::{future::FutureExt, StreamExt};
 use mongodb::{
     bson::{doc, spec::BinarySubtype, Binary, Bson, DateTime, Document, Regex},
-    options::{FindOptions, ReplaceOptions},
-    Client, Collection, Database,
+    options::{FindOptions, IndexOptions, UpdateOptions},
+    Client, Collection, Database, IndexModel,
 };
 use regex as re;
 use serde_json::json;
@@ -14,6 +14,7 @@ use std::{
         atomic::{AtomicI64, Ordering},
         Arc,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::{Builder, Runtime};
 use zenoh::bytes::{Encoding, ZBytes};
@@ -110,21 +111,27 @@ pub struct MongoDbStorage {
     runtime: Arc<Runtime>,
     wal_collection: Collection<Document>,
     wal_seq: Arc<AtomicI64>,
+    indexes_ready: tokio::sync::Mutex<bool>,
 }
 
 impl MongoDbStorage {
     pub fn new(database: &Database, collection_name: &str, runtime: Arc<Runtime>) -> Self {
         let collection = database.collection::<Document>(collection_name);
         let wal_collection = database.collection::<Document>("wal_log");
-        let wal_seq_start = runtime
-            .block_on(async { wal_collection.estimated_document_count(None).await })
-            .unwrap_or(0) as i64;
+        // Avoid `block_on()` in constructors: this type is often created inside an existing Tokio runtime
+        // (e.g., `Volume::create_storage()`), and nesting runtimes would panic.
+        let wal_seq_start = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+            .saturating_mul(1_000);
         MongoDbStorage {
             collection,
             collection_name: collection_name.to_string(),
             runtime,
             wal_collection,
             wal_seq: Arc::new(AtomicI64::new(wal_seq_start)),
+            indexes_ready: tokio::sync::Mutex::new(false),
         }
     }
 
@@ -201,6 +208,54 @@ impl MongoDbStorage {
                 .map(|_| ())
         })
         .await
+    }
+
+    async fn ensure_indexes(&self) -> ZResult<()> {
+        let mut guard = self.indexes_ready.lock().await;
+        if *guard {
+            return Ok(());
+        }
+
+        let collection = self.collection.clone();
+        let wal_collection = self.wal_collection.clone();
+        self.run_on_runtime(async move {
+            collection
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "key": 1 })
+                        .options(IndexOptions::builder().unique(true).build())
+                        .build(),
+                    None,
+                )
+                .await?;
+            collection
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "timestamp_raw": -1 })
+                        .build(),
+                    None,
+                )
+                .await?;
+            wal_collection
+                .create_index(
+                    IndexModel::builder().keys(doc! { "seq_id": 1 }).build(),
+                    None,
+                )
+                .await?;
+            wal_collection
+                .create_index(
+                    IndexModel::builder()
+                        .keys(doc! { "created_at": 1 })
+                        .build(),
+                    None,
+                )
+                .await?;
+            Ok(())
+        })
+        .await?;
+
+        *guard = true;
+        Ok(())
     }
 
     pub async fn enumerate(&self, key_expr: &str) -> ZResult<Vec<StorageEntry>> {
@@ -316,58 +371,93 @@ impl Storage for MongoDbStorage {
         encoding: Encoding,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
+        self.ensure_indexes().await?;
+
         let key_bson = match key {
             Some(ref k) => Bson::String(k.to_string()),
             None => Bson::Null,
         };
-        let key_filter = key_bson.clone();
         let payload = value.to_bytes().into_owned();
         let value_text = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok();
         let encoding_str: Cow<'static, str> = (&encoding).into();
-        let mut document = doc! {
-            "key": key_bson,
-            "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
-            "encoding": encoding_str.as_ref(),
-            "timestamp": timestamp.to_string(),
-            "timestamp_raw": Self::timestamp_to_i64(&timestamp),
-        };
-        if let Some(text) = value_text {
-            document.insert("value_text", text);
-        }
-        let collection = self.collection.clone();
+        let incoming_ts_raw = Self::timestamp_to_i64(&timestamp);
         let incoming_ts_str = timestamp.to_string();
         self.append_wal("PUT", &key, &timestamp, Some(&payload), Some(encoding_str.as_ref()))
             .await?;
-        self.run_on_runtime(async move {
-            // Quick timestamp check: if an existing doc has a newer or equal ts, treat this as outdated.
-            if let Some(existing) = collection
-                .find_one(doc! { "key": key_filter.clone() }, None)
-                .await?
-            {
-                if let Some(existing_ts_str) = existing.get_str("timestamp").ok() {
-                    if let (Ok(existing_ts), Ok(incoming_ts)) =
-                        (Timestamp::from_str(existing_ts_str), Timestamp::from_str(&incoming_ts_str))
-                    {
-                        if existing_ts >= incoming_ts {
-                            return Ok(StorageInsertionResult::Outdated);
-                        }
-                    }
+
+        let key_filter = key_bson.clone();
+        let mut set_doc = doc! {
+            "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
+            "encoding": encoding_str.as_ref(),
+            "timestamp": incoming_ts_str,
+            "timestamp_raw": incoming_ts_raw,
+        };
+        if let Some(text) = value_text {
+            set_doc.insert("value_text", text);
+        }
+
+        let collection = self.collection.clone();
+        let filter = doc! {
+            "key": key_filter.clone(),
+            "$or": [
+                { "timestamp_raw": { "$lt": incoming_ts_raw } },
+                { "timestamp_raw": { "$exists": false } }
+            ]
+        };
+        let update = doc! {
+            "$set": set_doc,
+            "$setOnInsert": { "key": key_filter.clone() }
+        };
+
+        let upsert_opts = UpdateOptions::builder().upsert(true).build();
+        let result = self
+            .run_on_runtime(async move { collection.update_one(filter, update, upsert_opts).await })
+            .await;
+
+        match result {
+            Ok(res) => {
+                if res.upserted_id.is_some() {
+                    Ok(StorageInsertionResult::Inserted)
+                } else if res.matched_count > 0 {
+                    Ok(StorageInsertionResult::Replaced)
+                } else {
+                    Ok(StorageInsertionResult::Outdated)
                 }
             }
-
-            let options = ReplaceOptions::builder().upsert(true).build(); // Upsert to ensure idempotency
-            collection
-                .replace_one(doc! { "key": key_filter }, document, options)
-                .await
-                .map(|res| {
-                    if res.matched_count > 0 {
-                        StorageInsertionResult::Replaced
-                    } else {
-                        StorageInsertionResult::Inserted
-                    }
-                })
-        })
-        .await
+            Err(e) if format!("{e}").contains("E11000") => {
+                // Concurrent writer likely inserted; retry once without upsert to avoid duplicates.
+                let key_filter = key_bson.clone();
+                let collection = self.collection.clone();
+                let filter = doc! {
+                    "key": key_filter.clone(),
+                    "$or": [
+                        { "timestamp_raw": { "$lt": incoming_ts_raw } },
+                        { "timestamp_raw": { "$exists": false } }
+                    ]
+                };
+                let mut set_doc = doc! {
+                    "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
+                    "encoding": encoding_str.as_ref(),
+                    "timestamp": timestamp.to_string(),
+                    "timestamp_raw": incoming_ts_raw,
+                };
+                if let Some(text) = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok() {
+                    set_doc.insert("value_text", text);
+                }
+                let update = doc! { "$set": set_doc };
+                let res = self
+                    .run_on_runtime(async move {
+                        collection.update_one(filter, update, None).await
+                    })
+                    .await?;
+                if res.matched_count > 0 {
+                    Ok(StorageInsertionResult::Replaced)
+                } else {
+                    Ok(StorageInsertionResult::Outdated)
+                }
+            }
+            Err(e) => Err(format!("MongoDB PUT failed: {e}").into()),
+        }
     }
 
     async fn get(

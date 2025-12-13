@@ -233,3 +233,347 @@ fn tc12_wal_logs_delete() {
         .expect("query wal");
     assert!(wal_entry.is_some(), "wal entry for DELETE missing");
 }
+
+// Legacy tests retained
+#[test]
+fn legacy_round_trip_put_get() {
+    if !docker_available() {
+        eprintln!("Skipping legacy_round_trip_put_get: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let mut rest = serde_json::Map::new();
+    rest.insert("mongodb_uri".into(), uri.clone().into());
+    rest.insert("database".into(), "zenoh_legacy_rt".into());
+    let vol_cfg = VolumeConfig {
+        name: "mongo_volume".into(),
+        backend: Some("zenoh_backend_mongodb".into()),
+        paths: None,
+        required: true,
+        rest: rest.into(),
+    };
+    let storage_cfg = StorageConfig {
+        name: "mongo_storage".into(),
+        key_expr: OwnedKeyExpr::try_from("demo/mongo/**").unwrap(),
+        complete: false,
+        strip_prefix: Some(OwnedKeyExpr::try_from("demo/mongo").unwrap()),
+        volume_id: vol_cfg.name.clone(),
+        volume_cfg: serde_json::json!({ "collection": "zenoh_legacy_rt_coll" }).into(),
+        garbage_collection_config: GarbageCollectionConfig::default(),
+        replication: None,
+    };
+    let volume = MongoDbBackend::start("mongo_volume", &vol_cfg).unwrap();
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_cfg).await })
+        .unwrap();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/test-key").unwrap());
+    let payload: ZBytes = "{'sensor_id':123,'temp':25.5}".into();
+    let encoding = Encoding::from("text/plain");
+    let ts = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a").unwrap();
+    runtime
+        .block_on(async { storage.put(key.clone(), payload.clone(), encoding.clone(), ts).await })
+        .unwrap();
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].encoding, encoding);
+    assert_eq!(fetched[0].payload, payload);
+}
+
+#[test]
+fn legacy_delete_removes_data() {
+    if !docker_available() {
+        eprintln!("Skipping legacy_delete_removes_data: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let mut rest = serde_json::Map::new();
+    rest.insert("mongodb_uri".into(), uri.clone().into());
+    rest.insert("database".into(), "zenoh_legacy_del".into());
+    let vol_cfg = VolumeConfig {
+        name: "mongo_volume".into(),
+        backend: Some("zenoh_backend_mongodb".into()),
+        paths: None,
+        required: true,
+        rest: rest.into(),
+    };
+    let storage_cfg = StorageConfig {
+        name: "mongo_storage".into(),
+        key_expr: OwnedKeyExpr::try_from("demo/mongo/**").unwrap(),
+        complete: false,
+        strip_prefix: Some(OwnedKeyExpr::try_from("demo/mongo").unwrap()),
+        volume_id: vol_cfg.name.clone(),
+        volume_cfg: serde_json::json!({ "collection": "zenoh_legacy_del_coll" }).into(),
+        garbage_collection_config: GarbageCollectionConfig::default(),
+        replication: None,
+    };
+    let volume = MongoDbBackend::start("mongo_volume", &vol_cfg).unwrap();
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_cfg).await })
+        .unwrap();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/delete-key").unwrap());
+    let payload: ZBytes = "to be deleted".into();
+    let encoding = Encoding::from("text/plain");
+    let ts = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a").unwrap();
+
+    runtime
+        .block_on(async { storage.put(key.clone(), payload, encoding, ts).await })
+        .unwrap();
+    let deleted = runtime
+        .block_on(async { storage.delete(key.clone(), ts).await })
+        .unwrap();
+    assert!(matches!(deleted, StorageInsertionResult::Deleted));
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .unwrap();
+    assert!(fetched.is_empty());
+}
+
+#[test]
+fn legacy_round_trip_non_utf8_payload() {
+    if !docker_available() {
+        eprintln!("Skipping legacy_round_trip_non_utf8_payload: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let mut rest = serde_json::Map::new();
+    rest.insert("mongodb_uri".into(), uri.clone().into());
+    rest.insert("database".into(), "zenoh_legacy_nonutf8".into());
+    let vol_cfg = VolumeConfig {
+        name: "mongo_volume".into(),
+        backend: Some("zenoh_backend_mongodb".into()),
+        paths: None,
+        required: true,
+        rest: rest.into(),
+    };
+    let storage_cfg = StorageConfig {
+        name: "mongo_storage".into(),
+        key_expr: OwnedKeyExpr::try_from("demo/mongo/**").unwrap(),
+        complete: false,
+        strip_prefix: Some(OwnedKeyExpr::try_from("demo/mongo").unwrap()),
+        volume_id: vol_cfg.name.clone(),
+        volume_cfg: serde_json::json!({ "collection": "zenoh_legacy_nonutf8_coll" }).into(),
+        garbage_collection_config: GarbageCollectionConfig::default(),
+        replication: None,
+    };
+    let volume = MongoDbBackend::start("mongo_volume", &vol_cfg).unwrap();
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_cfg).await })
+        .unwrap();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/non-utf8").unwrap());
+    let payload: ZBytes = vec![0xFF, 0xFE, 0xFD].into();
+    let encoding = Encoding::from("application/octet-stream");
+    let ts = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a").unwrap();
+
+    runtime
+        .block_on(async { storage.put(key.clone(), payload.clone(), encoding.clone(), ts).await })
+        .unwrap();
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload, payload);
+    assert_eq!(fetched[0].encoding, encoding);
+}
+
+#[test]
+fn legacy_rejects_older_timestamp() {
+    if !docker_available() {
+        eprintln!("Skipping legacy_rejects_older_timestamp: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let mut rest = serde_json::Map::new();
+    rest.insert("mongodb_uri".into(), uri.clone().into());
+    rest.insert("database".into(), "zenoh_legacy_lww".into());
+    let vol_cfg = VolumeConfig {
+        name: "mongo_volume".into(),
+        backend: Some("zenoh_backend_mongodb".into()),
+        paths: None,
+        required: true,
+        rest: rest.into(),
+    };
+    let storage_cfg = StorageConfig {
+        name: "mongo_storage".into(),
+        key_expr: OwnedKeyExpr::try_from("demo/mongo/**").unwrap(),
+        complete: false,
+        strip_prefix: Some(OwnedKeyExpr::try_from("demo/mongo").unwrap()),
+        volume_id: vol_cfg.name.clone(),
+        volume_cfg: serde_json::json!({ "collection": "zenoh_legacy_lww_coll" }).into(),
+        garbage_collection_config: GarbageCollectionConfig::default(),
+        replication: None,
+    };
+    let volume = MongoDbBackend::start("mongo_volume", &vol_cfg).unwrap();
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_cfg).await })
+        .unwrap();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/last-write-wins").unwrap());
+    let newer_payload: ZBytes = "newer-payload".into();
+    let older_payload: ZBytes = "older-payload".into();
+    let encoding = Encoding::from("text/plain");
+    let newer_ts =
+        Timestamp::from_str("7054123832858541151/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
+    let older_ts =
+        Timestamp::from_str("7054123566570568799/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
+
+    runtime
+        .block_on(async {
+            storage
+                .put(key.clone(), newer_payload.clone(), encoding.clone(), newer_ts)
+                .await?;
+            storage
+                .put(key.clone(), older_payload.clone(), encoding.clone(), older_ts)
+                .await
+        })
+        .unwrap();
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload, newer_payload);
+}
+
+#[test]
+fn legacy_put_is_idempotent() {
+    if !docker_available() {
+        eprintln!("Skipping legacy_put_is_idempotent: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let mut rest = serde_json::Map::new();
+    rest.insert("mongodb_uri".into(), uri.clone().into());
+    rest.insert("database".into(), "zenoh_legacy_idem".into());
+    let vol_cfg = VolumeConfig {
+        name: "mongo_volume".into(),
+        backend: Some("zenoh_backend_mongodb".into()),
+        paths: None,
+        required: true,
+        rest: rest.into(),
+    };
+    let storage_cfg = StorageConfig {
+        name: "mongo_storage".into(),
+        key_expr: OwnedKeyExpr::try_from("demo/mongo/**").unwrap(),
+        complete: false,
+        strip_prefix: Some(OwnedKeyExpr::try_from("demo/mongo").unwrap()),
+        volume_id: vol_cfg.name.clone(),
+        volume_cfg: serde_json::json!({ "collection": "zenoh_legacy_idem_coll" }).into(),
+        garbage_collection_config: GarbageCollectionConfig::default(),
+        replication: None,
+    };
+    let volume = MongoDbBackend::start("mongo_volume", &vol_cfg).unwrap();
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_cfg).await })
+        .unwrap();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/idempotent-key").unwrap());
+    let payload: ZBytes = "{'sensor_id':123,'temp':25.5}".into();
+    let encoding = Encoding::from("text/plain");
+    let ts = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a").unwrap();
+
+    runtime
+        .block_on(async {
+            storage
+                .put(key.clone(), payload.clone(), encoding.clone(), ts)
+                .await?;
+            storage
+                .put(key.clone(), payload.clone(), encoding.clone(), ts)
+                .await
+        })
+        .unwrap();
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .unwrap();
+    assert_eq!(fetched.len(), 1);
+    assert_eq!(fetched[0].payload, payload);
+}
+
+#[test]
+fn legacy_delete_unknown_key() {
+    if !docker_available() {
+        eprintln!("Skipping legacy_delete_unknown_key: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let mut rest = serde_json::Map::new();
+    rest.insert("mongodb_uri".into(), uri.clone().into());
+    rest.insert("database".into(), "zenoh_legacy_del_unknown".into());
+    let vol_cfg = VolumeConfig {
+        name: "mongo_volume".into(),
+        backend: Some("zenoh_backend_mongodb".into()),
+        paths: None,
+        required: true,
+        rest: rest.into(),
+    };
+    let storage_cfg = StorageConfig {
+        name: "mongo_storage".into(),
+        key_expr: OwnedKeyExpr::try_from("demo/mongo/**").unwrap(),
+        complete: false,
+        strip_prefix: Some(OwnedKeyExpr::try_from("demo/mongo").unwrap()),
+        volume_id: vol_cfg.name.clone(),
+        volume_cfg: serde_json::json!({ "collection": "zenoh_legacy_del_unknown_coll" }).into(),
+        garbage_collection_config: GarbageCollectionConfig::default(),
+        replication: None,
+    };
+    let volume = MongoDbBackend::start("mongo_volume", &vol_cfg).unwrap();
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_cfg).await })
+        .unwrap();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/delete-key").unwrap());
+    let ts = Timestamp::from_str("7568996723869121120/9787a2e42432ae5da9f0ece1fb81975a").unwrap();
+    let res = runtime
+        .block_on(async { storage.delete(key.clone(), ts).await })
+        .unwrap();
+    assert!(matches!(res, StorageInsertionResult::Deleted));
+}
+
+#[test]
+fn legacy_get_unknown_key() {
+    if !docker_available() {
+        eprintln!("Skipping legacy_get_unknown_key: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let runtime = Runtime::new().expect("Tokio runtime must start");
+    let mut rest = serde_json::Map::new();
+    rest.insert("mongodb_uri".into(), uri.clone().into());
+    rest.insert("database".into(), "zenoh_legacy_get_unknown".into());
+    let vol_cfg = VolumeConfig {
+        name: "mongo_volume".into(),
+        backend: Some("zenoh_backend_mongodb".into()),
+        paths: None,
+        required: true,
+        rest: rest.into(),
+    };
+    let storage_cfg = StorageConfig {
+        name: "mongo_storage".into(),
+        key_expr: OwnedKeyExpr::try_from("demo/mongo/**").unwrap(),
+        complete: false,
+        strip_prefix: Some(OwnedKeyExpr::try_from("demo/mongo").unwrap()),
+        volume_id: vol_cfg.name.clone(),
+        volume_cfg: serde_json::json!({ "collection": "zenoh_legacy_get_unknown_coll" }).into(),
+        garbage_collection_config: GarbageCollectionConfig::default(),
+        replication: None,
+    };
+    let volume = MongoDbBackend::start("mongo_volume", &vol_cfg).unwrap();
+    let mut storage = runtime
+        .block_on(async { volume.create_storage(storage_cfg).await })
+        .unwrap();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/unknown-key").unwrap());
+    let fetched: Vec<StoredData> = runtime
+        .block_on(async { storage.get(key.clone(), "").await })
+        .unwrap();
+    assert!(fetched.is_empty());
+}

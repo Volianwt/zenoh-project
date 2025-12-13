@@ -13,6 +13,7 @@ use tokio::runtime::Runtime;
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::key_expr::OwnedKeyExpr;
 use zenoh::time::Timestamp;
+use zenoh_backend_traits::Storage;
 use zenoh_backend_mongodb::MongoDbStorage;
 
 fn start_mongo() -> (testcontainers::Container<GenericImage>, String) {
