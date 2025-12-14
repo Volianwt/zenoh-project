@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use futures::{future::FutureExt, StreamExt};
 use mongodb::{
     bson::{doc, spec::BinarySubtype, Binary, Bson, DateTime, Document, Regex},
-    options::{FindOptions, IndexOptions, UpdateOptions},
+    options::{
+        FindOneAndUpdateOptions, FindOptions, IndexOptions, ReturnDocument, UpdateOptions,
+    },
     Client, Collection, Database, IndexModel,
 };
 use regex as re;
@@ -10,11 +12,7 @@ use serde_json::json;
 use std::{
     borrow::Cow,
     str::FromStr,
-    sync::{
-        atomic::{AtomicI64, Ordering},
-        Arc,
-    },
-    time::{SystemTime, UNIX_EPOCH},
+    sync::Arc,
 };
 use tokio::runtime::{Builder, Runtime};
 use zenoh::bytes::{Encoding, ZBytes};
@@ -110,7 +108,7 @@ pub struct MongoDbStorage {
     collection_name: String,
     runtime: Arc<Runtime>,
     wal_collection: Collection<Document>,
-    wal_seq: Arc<AtomicI64>,
+    wal_seq_collection: Collection<Document>,
     indexes_ready: tokio::sync::Mutex<bool>,
 }
 
@@ -118,19 +116,13 @@ impl MongoDbStorage {
     pub fn new(database: &Database, collection_name: &str, runtime: Arc<Runtime>) -> Self {
         let collection = database.collection::<Document>(collection_name);
         let wal_collection = database.collection::<Document>("wal_log");
-        // Avoid `block_on()` in constructors: this type is often created inside an existing Tokio runtime
-        // (e.g., `Volume::create_storage()`), and nesting runtimes would panic.
-        let wal_seq_start = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0)
-            .saturating_mul(1_000);
+        let wal_seq_collection = database.collection::<Document>("wal_seq");
         MongoDbStorage {
             collection,
             collection_name: collection_name.to_string(),
             runtime,
             wal_collection,
-            wal_seq: Arc::new(AtomicI64::new(wal_seq_start)),
+            wal_seq_collection,
             indexes_ready: tokio::sync::Mutex::new(false),
         }
     }
@@ -173,6 +165,17 @@ impl MongoDbStorage {
         }
     }
 
+    fn read_i64_field(doc: &Document, field: &str) -> Option<i64> {
+        doc.get_i64(field)
+            .ok()
+            .or_else(|| doc.get_i32(field).ok().map(|v| v as i64))
+            .or_else(|| {
+                doc.get_str(field)
+                    .ok()
+                    .and_then(|s| s.parse::<i64>().ok())
+            })
+    }
+
     async fn append_wal(
         &self,
         op: &str,
@@ -181,7 +184,7 @@ impl MongoDbStorage {
         payload: Option<&[u8]>,
         enc: Option<&str>,
     ) -> ZResult<()> {
-        let seq_id = self.wal_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let seq_id = self.next_wal_seq().await?;
         let key_str = key.as_ref().map(|k| k.to_string()).unwrap_or_default();
         let payload_size = payload.map(|p| p.len() as i64).unwrap_or(0);
         let ts_raw = Self::timestamp_to_i64(ts);
@@ -293,7 +296,7 @@ impl MongoDbStorage {
         paging: Option<(i64, i64)>,
     ) -> ZResult<Vec<StorageEntry>> {
         let regex = Self::build_regex_from_prefix(key_expr);
-        let mut filter = doc! { "key": { "$regex": regex } };
+        let mut filter = doc! { "key": { "$regex": regex }, "deleted": { "$ne": true } };
         if from_ts.is_some() || to_ts.is_some() {
             let mut ts_filter = doc! {};
             if let Some(f) = from_ts {
@@ -353,6 +356,32 @@ impl MongoDbStorage {
             })
             .collect()
     }
+
+    async fn next_wal_seq(&self) -> ZResult<i64> {
+        let wal_seq_collection = self.wal_seq_collection.clone();
+        let updated = self
+            .run_on_runtime(async move {
+                let opts = FindOneAndUpdateOptions::builder()
+                    .upsert(true)
+                    .return_document(ReturnDocument::After)
+                    .build();
+                wal_seq_collection
+                    .find_one_and_update(
+                        doc! { "_id": "wal_seq" },
+                        doc! { "$inc": { "seq_id": 1_i64 } },
+                        opts,
+                    )
+                    .await
+            })
+            .await?;
+        updated
+            .and_then(|doc| {
+                doc.get_i64("seq_id")
+                    .ok()
+                    .or_else(|| doc.get_i32("seq_id").ok().map(|v| v as i64))
+            })
+            .ok_or_else(|| "MongoDB WAL sequence fetch failed".into())
+    }
 }
 
 #[async_trait]
@@ -391,6 +420,7 @@ impl Storage for MongoDbStorage {
             "encoding": encoding_str.as_ref(),
             "timestamp": incoming_ts_str,
             "timestamp_raw": incoming_ts_raw,
+            "deleted": false,
         };
         if let Some(text) = value_text {
             set_doc.insert("value_text", text);
@@ -400,14 +430,11 @@ impl Storage for MongoDbStorage {
         let filter = doc! {
             "key": key_filter.clone(),
             "$or": [
-                { "timestamp_raw": { "$lt": incoming_ts_raw } },
+                { "timestamp_raw": { "$lte": incoming_ts_raw } },
                 { "timestamp_raw": { "$exists": false } }
             ]
         };
-        let update = doc! {
-            "$set": set_doc,
-            "$setOnInsert": { "key": key_filter.clone() }
-        };
+        let update = doc! { "$set": set_doc, "$setOnInsert": { "key": key_filter.clone() } };
 
         let upsert_opts = UpdateOptions::builder().upsert(true).build();
         let result = self
@@ -440,6 +467,7 @@ impl Storage for MongoDbStorage {
                     "encoding": encoding_str.as_ref(),
                     "timestamp": timestamp.to_string(),
                     "timestamp_raw": incoming_ts_raw,
+                    "deleted": false,
                 };
                 if let Some(text) = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok() {
                     set_doc.insert("value_text", text);
@@ -475,6 +503,9 @@ impl Storage for MongoDbStorage {
             .run_on_runtime(async move { collection.find_one(filter, None).await })
             .await?
         {
+            if document.get_bool("deleted").unwrap_or(false) {
+                return Ok(vec![]);
+            }
             let value = document
                 .get_binary_generic("value")
                 .map_err(|e| format!("MongoDB GET failed to read 'value': {e}"))?
@@ -503,21 +534,111 @@ impl Storage for MongoDbStorage {
         key: Option<OwnedKeyExpr>,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
+        self.ensure_indexes().await?;
+
         let key_bson = match key {
             Some(ref k) => Bson::String(k.to_string()),
             None => Bson::Null,
         };
-        let filter = doc! { "key": key_bson };
+        let incoming_ts_raw = Self::timestamp_to_i64(&timestamp);
+        let key_filter = key_bson.clone();
+        let filter = doc! {
+            "key": key_filter.clone(),
+            "$or": [
+                { "timestamp_raw": { "$lte": incoming_ts_raw } },
+                { "timestamp_raw": { "$exists": false } }
+            ]
+        };
         let collection = self.collection.clone();
         self.append_wal("DELETE", &key, &timestamp, None, None)
             .await?;
-        self.run_on_runtime(async move {
-            collection
-                .delete_one(filter, None)
-                .await
-                .map(|_| StorageInsertionResult::Deleted)
-        })
-        .await
+        let set_doc = doc! {
+            "deleted": true,
+            "timestamp": timestamp.to_string(),
+            "timestamp_raw": incoming_ts_raw,
+        };
+        let update = doc! {
+            "$set": set_doc,
+            "$unset": { "value": "", "value_text": "", "encoding": "" },
+            "$setOnInsert": { "key": key_filter.clone() }
+        };
+        let opts = UpdateOptions::builder().upsert(true).build();
+        let result = self
+            .run_on_runtime(async move { collection.update_one(filter, update, opts).await })
+            .await;
+        match result {
+            Ok(res) if res.upserted_id.is_some() || res.matched_count > 0 => {
+                Ok(StorageInsertionResult::Deleted)
+            }
+            Ok(_) => {
+                // Fallback: fetch current doc and decide based on timestamp.
+                let collection = self.collection.clone();
+                let key_filter = doc! { "key": key_bson };
+                let key_filter_clone = key_filter.clone();
+                let current = self
+                    .run_on_runtime(async move { collection.find_one(key_filter, None).await })
+                    .await?;
+                if let Some(doc) = current {
+                    if let Some(ts_raw) = Self::read_i64_field(&doc, "timestamp_raw") {
+                        if ts_raw > incoming_ts_raw {
+                            return Ok(StorageInsertionResult::Outdated);
+                        }
+                    }
+                }
+                // Either no document or not newer: force tombstone without timestamp gating.
+                let collection = self.collection.clone();
+                let update = doc! {
+                    "$set": {
+                        "deleted": true,
+                        "timestamp": timestamp.to_string(),
+                        "timestamp_raw": incoming_ts_raw,
+                    },
+                    "$unset": { "value": "", "value_text": "", "encoding": "" },
+                    "$setOnInsert": { "key": key_filter_clone.clone() }
+                };
+                self.run_on_runtime(async move {
+                    collection
+                        .update_one(doc! { "key": key_filter_clone }, update, UpdateOptions::builder().upsert(true).build())
+                        .await
+                })
+                .await?;
+                Ok(StorageInsertionResult::Deleted)
+            }
+            Err(e) if format!("{e}").contains("E11000") => {
+                // Duplicate key: there is already a doc for this key. Decide by timestamp then force tombstone.
+                let collection = self.collection.clone();
+                let key_doc = doc! { "key": key_bson.clone() };
+                let existing = self
+                    .run_on_runtime(async move { collection.find_one(key_doc, None).await })
+                    .await?;
+                if let Some(doc) = existing {
+                    if let Some(ts_raw) = Self::read_i64_field(&doc, "timestamp_raw") {
+                        if ts_raw > incoming_ts_raw {
+                            return Ok(StorageInsertionResult::Outdated);
+                        }
+                    }
+                }
+                let collection = self.collection.clone();
+                let key_filter = doc! { "key": key_bson };
+                let update = doc! {
+                    "$set": {
+                        "deleted": true,
+                        "timestamp": timestamp.to_string(),
+                        "timestamp_raw": incoming_ts_raw,
+                    },
+                    "$unset": { "value": "", "value_text": "", "encoding": "" },
+                    "$setOnInsert": { "key": key_filter.clone() }
+                };
+                self.run_on_runtime(async move {
+                    collection
+                        .update_one(key_filter, update, UpdateOptions::builder().upsert(true).build())
+                        .await
+                })
+                .await?;
+                Ok(StorageInsertionResult::Deleted)
+            }
+            Err(e) => Err(format!("MongoDB DELETE failed: {e}").into()),
+        }
     }
 
     async fn get_all_entries(&self) -> ZResult<Vec<(Option<OwnedKeyExpr>, Timestamp)>> {
@@ -526,7 +647,7 @@ impl Storage for MongoDbStorage {
             .run_on_runtime(async move {
                 let mut cursor = collection
                     .find(
-                        doc! {},
+                        doc! { "deleted": { "$ne": true } },
                         FindOptions::builder()
                             .projection(doc! { "key": 1, "timestamp": 1 })
                             .build(),

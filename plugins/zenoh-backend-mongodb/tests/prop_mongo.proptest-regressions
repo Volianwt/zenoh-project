@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 83e62bcd3759c8b632f1ae3165614d5374d74c1cadefe33c919313dad30f70ed # shrinks to ops = [Op { ts_raw: 999482, kind: Delete }, Op { ts_raw: 556705, kind: Delete }, Op { ts_raw: 35136, kind: Put }, Op { ts_raw: 245851, kind: Delete }, Op { ts_raw: 476843, kind: Put }, Op { ts_raw: 684523, kind: Put }, Op { ts_raw: 678658, kind: Put }, Op { ts_raw: 900343, kind: Put }, Op { ts_raw: 868123, kind: Put }]
