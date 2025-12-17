@@ -1,4 +1,5 @@
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpKind {
@@ -49,6 +50,10 @@ prop_compose! {
 }
 
 proptest! {
+    #![proptest_config(ProptestConfig {
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
+        .. ProptestConfig::default()
+    })]
     #[test]
     fn lww_last_of_max_ts_wins(ops in prop::collection::vec(arb_op(), 1..50)) {
         // Model: apply ops and ensure tie-break is "last among max ts".

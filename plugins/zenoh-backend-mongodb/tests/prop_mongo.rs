@@ -3,6 +3,7 @@ use std::{str::FromStr, sync::Arc};
 use futures::StreamExt;
 use mongodb::bson::doc;
 use proptest::prelude::*;
+use proptest::test_runner::FileFailurePersistence;
 use testcontainers::{core::WaitFor, runners::SyncRunner, GenericImage};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -101,7 +102,11 @@ fn read_i64_field(doc: &mongodb::bson::Document, field: &str) -> Option<i64> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 32, .. ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        failure_persistence: Some(Box::new(FileFailurePersistence::WithSource("proptest-regressions"))),
+        .. ProptestConfig::default()
+    })]
     #[test]
     fn lww_matches_model(ops in prop::collection::vec(arb_op(), 1..30)) {
         if std::env::var("RUN_PROP_MONGO").ok().as_deref() != Some("1") {
