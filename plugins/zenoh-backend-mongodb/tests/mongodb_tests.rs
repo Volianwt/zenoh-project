@@ -8,7 +8,7 @@ use zenoh::key_expr::OwnedKeyExpr;
 use zenoh::time::Timestamp;
 use zenoh_backend_traits::config::{GarbageCollectionConfig, StorageConfig, VolumeConfig};
 use zenoh_backend_traits::{Storage, StorageInsertionResult, StoredData};
-use zenoh_backend_mongodb::{MongoDbBackend, MongoDbStorage, PageRequest};
+use zenoh_backend_mongodb::{metrics_snapshot, MongoDbBackend, MongoDbStorage, PageRequest};
 use zenoh_plugin_trait::Plugin;
 
 fn docker_available() -> bool {
@@ -99,12 +99,14 @@ fn tc9_range_query() {
     let t2 = Timestamp::from_str("7054124000000000000/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
     let t3 = Timestamp::from_str("7054125000000000000/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
 
+    println!("\n[FR7/TC9] Inserting 3 entries under prefix '{base}' (t1<t2<t3)...");
     runtime.block_on(async {
         for (k, v, ts) in [
             (format!("{base}/a"), "v1", t1),
             (format!("{base}/b"), "v2", t2),
             (format!("{base}/c"), "v3", t3),
         ] {
+            println!("  PUT key='{k}' ts='{ts}' payload='{v}'");
             storage
                 .put(
                     Some(OwnedKeyExpr::try_from(k.as_str()).unwrap()),
@@ -117,9 +119,19 @@ fn tc9_range_query() {
         }
     });
 
+    println!("[FR7/TC9] Querying range: from_ts='{t1}' to_ts='{t2}'");
     let entries = runtime
         .block_on(async { storage.enumerate_range(base, Some(t1), Some(t2)).await })
         .expect("range succeeds");
+    println!("[FR7/TC9] Returned {} entries (sorted by timestamp desc):", entries.len());
+    for (idx, e) in entries.iter().enumerate() {
+        let key = e
+            .key
+            .as_ref()
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "<null>".to_string());
+        println!("  [{idx}] key='{key}' ts='{}'", e.timestamp);
+    }
     assert_eq!(entries.len(), 2);
     let keys: Vec<String> = entries
         .iter()
@@ -140,6 +152,7 @@ fn tc10_pagination() {
         create_storage_direct(&uri, "zenoh_tc10_db", "zenoh_tc10_coll");
 
     let base = "demo/mongo/paging";
+    println!("\n[FR8/TC10] Inserting 20 entries under prefix '{base}'...");
     for i in 0..20 {
         let ts = Timestamp::from_str(&format!(
             "7054123{}000000000/BC779A06D7E049BD88C3FF3DB0C17FCC",
@@ -148,15 +161,35 @@ fn tc10_pagination() {
         .unwrap();
         let key = Some(OwnedKeyExpr::try_from(format!("{base}/{i}").as_str()).unwrap());
         let payload: ZBytes = format!("v{i}").into();
+        println!(
+            "  PUT key='{}' ts='{ts}' payload='v{i}'",
+            key.as_ref().unwrap()
+        );
         runtime
             .block_on(async { storage.put(key, payload, Encoding::from("text/plain"), ts).await })
             .unwrap();
     }
 
     let page = PageRequest { limit: 5, offset: 5 };
+    println!(
+        "[FR8/TC10] Querying page: limit={} offset={}",
+        page.limit, page.offset
+    );
     let entries = runtime
         .block_on(async { storage.enumerate_paged(base, page).await })
         .unwrap();
+    println!(
+        "[FR8/TC10] Returned {} entries (sorted by timestamp desc):",
+        entries.len()
+    );
+    for (idx, e) in entries.iter().enumerate() {
+        let key = e
+            .key
+            .as_ref()
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "<null>".to_string());
+        println!("  [{idx}] key='{key}' ts='{}'", e.timestamp);
+    }
     assert_eq!(entries.len(), 5);
     assert!(entries.iter().all(|e| e.key.as_ref().unwrap().to_string().starts_with(base)));
 }
@@ -232,6 +265,40 @@ fn tc12_wal_logs_delete() {
         })
         .expect("query wal");
     assert!(wal_entry.is_some(), "wal entry for DELETE missing");
+}
+
+#[test]
+fn tc13_metrics_counters_increment_correctly() {
+    if !docker_available() {
+        eprintln!("Skipping tc13_metrics_counters_increment_correctly: Docker unavailable");
+        return;
+    }
+    let (_container, uri) = start_mongo();
+    let (runtime, _db, mut storage) =
+        create_storage_direct(&uri, "zenoh_tc13_db", "zenoh_tc13_coll");
+
+    let before = metrics_snapshot();
+
+    let key = Some(OwnedKeyExpr::try_from("demo/mongo/metrics").unwrap());
+    let payload: ZBytes = "metrics-payload".into();
+    let encoding = Encoding::from("text/plain");
+    let ts = Timestamp::from_str("7054123555555555555/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
+
+    runtime.block_on(async {
+        storage
+            .put(key.clone(), payload, encoding, ts)
+            .await
+            .expect("put succeeds");
+        let got = storage.get(key.clone(), "").await.expect("get succeeds");
+        assert_eq!(got.len(), 1);
+        storage.delete(key.clone(), ts).await.expect("delete succeeds");
+    });
+
+    let after = metrics_snapshot();
+    assert!(after.puts >= before.puts + 1);
+    assert!(after.gets >= before.gets + 1);
+    assert!(after.deletes >= before.deletes + 1);
+    assert_eq!(after.errors, before.errors);
 }
 
 // Legacy tests retained

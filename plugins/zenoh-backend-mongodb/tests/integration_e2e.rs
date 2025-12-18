@@ -1,4 +1,4 @@
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Instant};
 
 use futures::future::try_join_all;
 use mongodb::Client;
@@ -69,12 +69,26 @@ fn create_storage_direct(
     MongoDbStorage::new(&db, collection, runtime.clone())
 }
 
+fn print_header(name: &str) {
+    println!("\n========== {name} ==========");
+}
+
+fn insertion_result_label(res: &StorageInsertionResult) -> &'static str {
+    match res {
+        StorageInsertionResult::Inserted => "Inserted",
+        StorageInsertionResult::Replaced => "Replaced",
+        StorageInsertionResult::Deleted => "Deleted",
+        StorageInsertionResult::Outdated => "Outdated",
+    }
+}
+
 #[test]
 fn it1_end_to_end_crud() {
     if !docker_available() {
         eprintln!("Skipping it1_end_to_end_crud: Docker unavailable");
         return;
     }
+    print_header("IT1 End-to-End CRUD (PUT -> GET -> DELETE)");
     let (_container, uri) = start_mongo();
     let runtime = Arc::new(Runtime::new().expect("Tokio runtime must start"));
     let vol_cfg = build_volume_config(&uri, "zenoh_it1_db");
@@ -83,26 +97,55 @@ fn it1_end_to_end_crud() {
     let mut storage = runtime
         .block_on(async { volume.create_storage(storage_cfg).await })
         .unwrap();
+    println!(
+        "[IT1] Mongo uri='{uri}', db='{}', collection='{}'",
+        "zenoh_it1_db", "zenoh_it1_coll"
+    );
 
     let key = Some(OwnedKeyExpr::try_from("demo/mongo/it1").unwrap());
     let payload: ZBytes = "it1-data".into();
     let encoding = Encoding::from("text/plain");
     let ts = Timestamp::from_str("7054123999999999999/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
 
+    println!(
+        "[IT1] PUT key='{}' ts='{ts}' payload='{}'",
+        key.as_ref().unwrap(),
+        std::str::from_utf8(payload.to_bytes().as_ref()).unwrap_or("<non-utf8>")
+    );
+    let t0 = Instant::now();
     let res = runtime
         .block_on(async { storage.put(key.clone(), payload.clone(), encoding.clone(), ts).await })
         .unwrap();
+    println!(
+        "[IT1] PUT result={} (elapsed {:?})",
+        insertion_result_label(&res),
+        t0.elapsed()
+    );
     assert!(matches!(res, StorageInsertionResult::Inserted));
 
+    println!("[IT1] GET key='{}'", key.as_ref().unwrap());
+    let t0 = Instant::now();
     let got: Vec<StoredData> = runtime
         .block_on(async { storage.get(key.clone(), "").await })
         .unwrap();
+    println!(
+        "[IT1] GET returned {} sample(s) (elapsed {:?})",
+        got.len(),
+        t0.elapsed()
+    );
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].payload, payload);
 
+    println!("[IT1] DELETE key='{}' ts='{ts}'", key.as_ref().unwrap());
+    let t0 = Instant::now();
     let del = runtime
         .block_on(async { storage.delete(key.clone(), ts).await })
         .unwrap();
+    println!(
+        "[IT1] DELETE result={} (elapsed {:?})",
+        insertion_result_label(&del),
+        t0.elapsed()
+    );
     assert!(matches!(del, StorageInsertionResult::Deleted));
     let after: Vec<StoredData> = runtime
         .block_on(async { storage.get(key.clone(), "").await })
@@ -116,6 +159,7 @@ fn it2_lww_conflict_resolution() {
         eprintln!("Skipping it2_lww_conflict_resolution: Docker unavailable");
         return;
     }
+    print_header("IT2 LWW Conflict Resolution (older PUT then newer PUT)");
     let (_container, uri) = start_mongo();
     let runtime = Arc::new(Runtime::new().expect("Tokio runtime must start"));
     let vol_cfg = build_volume_config(&uri, "zenoh_it2_db");
@@ -124,11 +168,17 @@ fn it2_lww_conflict_resolution() {
     let mut storage = runtime
         .block_on(async { volume.create_storage(storage_cfg).await })
         .unwrap();
+    println!(
+        "[IT2] Mongo uri='{uri}', db='{}', collection='{}'",
+        "zenoh_it2_db", "zenoh_it2_coll"
+    );
 
     let key = Some(OwnedKeyExpr::try_from("demo/mongo/it2").unwrap());
     let older = Timestamp::from_str("7054123000000000000/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
     let newer = Timestamp::from_str("7054125000000000000/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
 
+    println!("[IT2] PUT (older) key='{}' ts='{older}' payload='older'", key.as_ref().unwrap());
+    println!("[IT2] PUT (newer) key='{}' ts='{newer}' payload='newer'", key.as_ref().unwrap());
     runtime
         .block_on(async {
             storage
@@ -140,11 +190,17 @@ fn it2_lww_conflict_resolution() {
         })
         .unwrap();
 
+    println!("[IT2] GET key='{}' (expect newest payload)", key.as_ref().unwrap());
     let got: Vec<StoredData> = runtime
         .block_on(async { storage.get(key.clone(), "").await })
         .unwrap();
     assert_eq!(got.len(), 1);
     let body = got[0].payload.to_bytes().into_owned();
+    println!(
+        "[IT2] Final value ts='{}' payload='{}'",
+        got[0].timestamp,
+        std::str::from_utf8(&body).unwrap_or("<non-utf8>")
+    );
     assert_eq!(std::str::from_utf8(&body).unwrap(), "newer");
 }
 
@@ -154,6 +210,7 @@ fn it3_concurrency_latest_wins() {
         eprintln!("Skipping it3_concurrency_latest_wins: Docker unavailable");
         return;
     }
+    print_header("IT3 Concurrency (multiple PUTs, latest timestamp wins)");
     let (_container, uri) = start_mongo();
     let runtime = Arc::new(Runtime::new().expect("Tokio runtime must start"));
     let db_name = "zenoh_it3_db";
@@ -163,6 +220,8 @@ fn it3_concurrency_latest_wins() {
 
     let key = Some(OwnedKeyExpr::try_from("demo/mongo/it3").unwrap());
     let workers = 10usize;
+    println!("[IT3] Mongo uri='{uri}', db='{db_name}', collection='{coll}', workers={workers}");
+    println!("[IT3] Key='{}' (strip_prefix will store it as 'it3')", key.as_ref().unwrap());
     runtime.block_on(async {
         let mut tasks = Vec::new();
         for i in 0..workers {
@@ -185,12 +244,19 @@ fn it3_concurrency_latest_wins() {
         }
         let results = try_join_all(tasks).await.unwrap();
         let max_ts = results.into_iter().max().unwrap();
+        println!("[IT3] Expected final timestamp (max) = '{max_ts}'");
 
         // Use a fresh storage on the base collection to read final value.
         let base_storage_cfg = build_storage_config(&vol_cfg.name, coll);
         let mut final_storage = volume.create_storage(base_storage_cfg).await.unwrap();
         let got = final_storage.get(key.clone(), "").await.unwrap();
         assert_eq!(got.len(), 1);
+        let body = got[0].payload.to_bytes().into_owned();
+        println!(
+            "[IT3] Final stored ts='{}' payload='{}'",
+            got[0].timestamp,
+            std::str::from_utf8(&body).unwrap_or("<non-utf8>")
+        );
         assert_eq!(got[0].timestamp, max_ts);
     });
 }
@@ -201,6 +267,7 @@ fn it4_persistence_after_recreate() {
         eprintln!("Skipping it4_persistence_after_recreate: Docker unavailable");
         return;
     }
+    print_header("IT4 Persistence After Recreate (drop storage, recreate, read)");
     let (_container, uri) = start_mongo();
     let runtime = Arc::new(Runtime::new().expect("Tokio runtime must start"));
     let db_name = "zenoh_it4_db";
@@ -211,16 +278,21 @@ fn it4_persistence_after_recreate() {
     let key = Some(OwnedKeyExpr::try_from("demo/mongo/it4").unwrap());
     let payload: ZBytes = "persist".into();
     let ts = Timestamp::from_str("7054123888888888888/BC779A06D7E049BD88C3FF3DB0C17FCC").unwrap();
+    println!("[IT4] Mongo uri='{uri}', db='{db_name}', collection='{coll}'");
+    println!("[IT4] PUT key='{}' ts='{ts}' payload='persist'", key.as_ref().unwrap());
     runtime
         .block_on(async { storage1.put(key.clone(), payload.clone(), Encoding::from("text/plain"), ts).await })
         .unwrap();
 
     // Drop and recreate storage (simulate restart/reconnect).
+    println!("[IT4] Dropping storage instance and recreating it...");
     drop(storage1);
     let mut storage2 = create_storage_direct(&uri, db_name, coll, &runtime);
+    println!("[IT4] GET key='{}' after recreate (expect persisted value)", key.as_ref().unwrap());
     let got: Vec<StoredData> = runtime
         .block_on(async { storage2.get(key.clone(), "").await })
         .unwrap();
+    println!("[IT4] GET returned {} sample(s)", got.len());
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].payload, payload);
 }
@@ -231,12 +303,17 @@ fn it5_query_pagination_end_to_end() {
         eprintln!("Skipping it5_query_pagination_end_to_end: Docker unavailable");
         return;
     }
+    print_header("IT5 Query + Pagination (FR6-FR8 end-to-end)");
     let (_container, uri) = start_mongo();
     let runtime = Arc::new(Runtime::new().expect("Tokio runtime must start"));
     let storage = create_storage_direct(&uri, "zenoh_it5_db", "zenoh_it5_coll", &runtime);
     let mut storage = storage;
 
     let base = "demo/mongo/it5";
+    println!(
+        "[IT5] Mongo uri='{uri}', db='{}', collection='{}', base_prefix='{base}'",
+        "zenoh_it5_db", "zenoh_it5_coll"
+    );
     for i in 0..15 {
         let ts = Timestamp::from_str(&format!(
             "7054123{}000000000/BC779A06D7E049BD88C3FF3DB0C17FCC",
@@ -245,15 +322,36 @@ fn it5_query_pagination_end_to_end() {
         .unwrap();
         let key = Some(OwnedKeyExpr::try_from(format!("{base}/{i}").as_str()).unwrap());
         let payload: ZBytes = format!("p{i}").into();
+        if i < 3 || i >= 12 {
+            println!(
+                "  [IT5] PUT key='{}' ts='{ts}' payload='p{i}'",
+                key.as_ref().unwrap()
+            );
+        } else if i == 3 {
+            println!("  [IT5] ... (omitting middle inserts for readability) ...");
+        }
         runtime
             .block_on(async { storage.put(key, payload, Encoding::from("text/plain"), ts).await })
             .unwrap();
     }
 
     let page = PageRequest { limit: 5, offset: 5 };
+    println!(
+        "[IT5] enumerate_paged(prefix='{base}', limit={}, offset={})",
+        page.limit, page.offset
+    );
     let entries = runtime
         .block_on(async { storage.enumerate_paged(base, page).await })
         .unwrap();
+    println!("[IT5] Returned {} entries (sorted by timestamp desc):", entries.len());
+    for (idx, e) in entries.iter().enumerate() {
+        let key = e
+            .key
+            .as_ref()
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "<null>".to_string());
+        println!("  [IT5] [{idx}] key='{key}' ts='{}'", e.timestamp);
+    }
     assert_eq!(entries.len(), 5);
     assert!(entries.iter().all(|e| e.key.as_ref().unwrap().to_string().starts_with(base)));
 }

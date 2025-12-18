@@ -18,6 +18,7 @@ use zenoh_backend_traits::{Storage, StorageInsertionResult, StoredData};
 use zenoh_util::ffi::JsonValue;
 
 use crate::types::{PageRequest, StorageEntry};
+use crate::metrics::{inc_delete, inc_error, inc_get, inc_put};
 
 pub struct MongoDbStorage {
     collection: Collection<Document>,
@@ -316,90 +317,98 @@ impl Storage for MongoDbStorage {
         encoding: Encoding,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        self.ensure_indexes().await?;
+        inc_put();
+        let res: ZResult<StorageInsertionResult> = async {
+            self.ensure_indexes().await?;
 
-        let key_bson = match key {
-            Some(ref k) => Bson::String(k.to_string()),
-            None => Bson::Null,
-        };
-        let payload = value.to_bytes().into_owned();
-        let value_text = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok();
-        let encoding_str: Cow<'static, str> = (&encoding).into();
-        let incoming_ts_raw = Self::timestamp_to_i64(&timestamp);
-        let incoming_ts_str = timestamp.to_string();
-        self.append_wal("PUT", &key, &timestamp, Some(&payload), Some(encoding_str.as_ref()))
-            .await?;
+            let key_bson = match key {
+                Some(ref k) => Bson::String(k.to_string()),
+                None => Bson::Null,
+            };
+            let payload = value.to_bytes().into_owned();
+            let value_text = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok();
+            let encoding_str: Cow<'static, str> = (&encoding).into();
+            let incoming_ts_raw = Self::timestamp_to_i64(&timestamp);
+            let incoming_ts_str = timestamp.to_string();
+            self.append_wal("PUT", &key, &timestamp, Some(&payload), Some(encoding_str.as_ref()))
+                .await?;
 
-        let key_filter = key_bson.clone();
-        let mut set_doc = doc! {
-            "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
-            "encoding": encoding_str.as_ref(),
-            "timestamp": incoming_ts_str,
-            "timestamp_raw": incoming_ts_raw,
-            "deleted": false,
-        };
-        if let Some(text) = value_text {
-            set_doc.insert("value_text", text);
-        }
-
-        let collection = self.collection.clone();
-        let filter = doc! {
-            "key": key_filter.clone(),
-            "$or": [
-                { "timestamp_raw": { "$lte": incoming_ts_raw } },
-                { "timestamp_raw": { "$exists": false } }
-            ]
-        };
-        let update = doc! { "$set": set_doc, "$setOnInsert": { "key": key_filter.clone() } };
-
-        let upsert_opts = UpdateOptions::builder().upsert(true).build();
-        let result = self
-            .run_on_runtime(async move { collection.update_one(filter, update, upsert_opts).await })
-            .await;
-
-        match result {
-            Ok(res) => {
-                if res.upserted_id.is_some() {
-                    Ok(StorageInsertionResult::Inserted)
-                } else if res.matched_count > 0 {
-                    Ok(StorageInsertionResult::Replaced)
-                } else {
-                    Ok(StorageInsertionResult::Outdated)
-                }
+            let key_filter = key_bson.clone();
+            let mut set_doc = doc! {
+                "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
+                "encoding": encoding_str.as_ref(),
+                "timestamp": incoming_ts_str,
+                "timestamp_raw": incoming_ts_raw,
+                "deleted": false,
+            };
+            if let Some(text) = value_text {
+                set_doc.insert("value_text", text);
             }
-            Err(e) if format!("{e}").contains("E11000") => {
-                // Concurrent writer likely inserted; retry once without upsert to avoid duplicates.
-                let key_filter = key_bson.clone();
-                let collection = self.collection.clone();
-                let filter = doc! {
-                    "key": key_filter.clone(),
-                    "$or": [
-                        { "timestamp_raw": { "$lt": incoming_ts_raw } },
-                        { "timestamp_raw": { "$exists": false } }
-                    ]
-                };
-                let mut set_doc = doc! {
-                    "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
-                    "encoding": encoding_str.as_ref(),
-                    "timestamp": timestamp.to_string(),
-                    "timestamp_raw": incoming_ts_raw,
-                    "deleted": false,
-                };
-                if let Some(text) = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok() {
-                    set_doc.insert("value_text", text);
+
+            let collection = self.collection.clone();
+            let filter = doc! {
+                "key": key_filter.clone(),
+                "$or": [
+                    { "timestamp_raw": { "$lte": incoming_ts_raw } },
+                    { "timestamp_raw": { "$exists": false } }
+                ]
+            };
+            let update = doc! { "$set": set_doc, "$setOnInsert": { "key": key_filter.clone() } };
+
+            let upsert_opts = UpdateOptions::builder().upsert(true).build();
+            let result = self
+                .run_on_runtime(async move { collection.update_one(filter, update, upsert_opts).await })
+                .await;
+
+            match result {
+                Ok(res) => {
+                    if res.upserted_id.is_some() {
+                        Ok(StorageInsertionResult::Inserted)
+                    } else if res.matched_count > 0 {
+                        Ok(StorageInsertionResult::Replaced)
+                    } else {
+                        Ok(StorageInsertionResult::Outdated)
+                    }
                 }
-                let update = doc! { "$set": set_doc };
-                let res = self
-                    .run_on_runtime(async move { collection.update_one(filter, update, None).await })
-                    .await?;
-                if res.matched_count > 0 {
-                    Ok(StorageInsertionResult::Replaced)
-                } else {
-                    Ok(StorageInsertionResult::Outdated)
+                Err(e) if format!("{e}").contains("E11000") => {
+                    // Concurrent writer likely inserted; retry once without upsert to avoid duplicates.
+                    let key_filter = key_bson.clone();
+                    let collection = self.collection.clone();
+                    let filter = doc! {
+                        "key": key_filter.clone(),
+                        "$or": [
+                            { "timestamp_raw": { "$lt": incoming_ts_raw } },
+                            { "timestamp_raw": { "$exists": false } }
+                        ]
+                    };
+                    let mut set_doc = doc! {
+                        "value": Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: payload.clone() }),
+                        "encoding": encoding_str.as_ref(),
+                        "timestamp": timestamp.to_string(),
+                        "timestamp_raw": incoming_ts_raw,
+                        "deleted": false,
+                    };
+                    if let Some(text) = std::str::from_utf8(&payload).map(|s| s.to_owned()).ok() {
+                        set_doc.insert("value_text", text);
+                    }
+                    let update = doc! { "$set": set_doc };
+                    let res = self
+                        .run_on_runtime(async move { collection.update_one(filter, update, None).await })
+                        .await?;
+                    if res.matched_count > 0 {
+                        Ok(StorageInsertionResult::Replaced)
+                    } else {
+                        Ok(StorageInsertionResult::Outdated)
+                    }
                 }
+                Err(e) => Err(format!("MongoDB PUT failed: {e}").into()),
             }
-            Err(e) => Err(format!("MongoDB PUT failed: {e}").into()),
         }
+        .await;
+        if res.is_err() {
+            inc_error();
+        }
+        res
     }
 
     async fn get(
@@ -407,40 +416,48 @@ impl Storage for MongoDbStorage {
         key: Option<OwnedKeyExpr>,
         _parameters: &str,
     ) -> ZResult<Vec<StoredData>> {
-        let key_bson = match key {
-            Some(k) => Bson::String(k.to_string()),
-            None => Bson::Null,
-        };
-        let filter = doc! { "key": key_bson };
-        let collection = self.collection.clone();
-        if let Some(document) = self
-            .run_on_runtime(async move { collection.find_one(filter, None).await })
-            .await?
-        {
-            if document.get_bool("deleted").unwrap_or(false) {
-                return Ok(vec![]);
+        inc_get();
+        let res: ZResult<Vec<StoredData>> = async {
+            let key_bson = match key {
+                Some(k) => Bson::String(k.to_string()),
+                None => Bson::Null,
+            };
+            let filter = doc! { "key": key_bson };
+            let collection = self.collection.clone();
+            if let Some(document) = self
+                .run_on_runtime(async move { collection.find_one(filter, None).await })
+                .await?
+            {
+                if document.get_bool("deleted").unwrap_or(false) {
+                    return Ok(vec![]);
+                }
+                let value = document
+                    .get_binary_generic("value")
+                    .map_err(|e| format!("MongoDB GET failed to read 'value': {e}"))?
+                    .to_vec();
+                let encoding = document
+                    .get_str("encoding")
+                    .map(|s| Encoding::from(s))
+                    .map_err(|e| format!("MongoDB GET failed to read 'encoding': {e}"))?;
+                let timestamp_str = document
+                    .get_str("timestamp")
+                    .map_err(|e| format!("MongoDB GET failed to read 'timestamp': {e}"))?;
+                let timestamp = Timestamp::from_str(timestamp_str)
+                    .map_err(|e| format!("MongoDB GET failed to parse 'timestamp': {}", e.cause))?;
+                Ok(vec![StoredData {
+                    payload: value.into(),
+                    encoding,
+                    timestamp,
+                }])
+            } else {
+                Ok(vec![])
             }
-            let value = document
-                .get_binary_generic("value")
-                .map_err(|e| format!("MongoDB GET failed to read 'value': {e}"))?
-                .to_vec();
-            let encoding = document
-                .get_str("encoding")
-                .map(|s| Encoding::from(s))
-                .map_err(|e| format!("MongoDB GET failed to read 'encoding': {e}"))?;
-            let timestamp_str = document
-                .get_str("timestamp")
-                .map_err(|e| format!("MongoDB GET failed to read 'timestamp': {e}"))?;
-            let timestamp = Timestamp::from_str(timestamp_str)
-                .map_err(|e| format!("MongoDB GET failed to parse 'timestamp': {}", e.cause))?;
-            Ok(vec![StoredData {
-                payload: value.into(),
-                encoding,
-                timestamp,
-            }])
-        } else {
-            Ok(vec![])
         }
+        .await;
+        if res.is_err() {
+            inc_error();
+        }
+        res
     }
 
     async fn delete(
@@ -448,111 +465,119 @@ impl Storage for MongoDbStorage {
         key: Option<OwnedKeyExpr>,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        self.ensure_indexes().await?;
+        inc_delete();
+        let res: ZResult<StorageInsertionResult> = async {
+            self.ensure_indexes().await?;
 
-        let key_bson = match key {
-            Some(ref k) => Bson::String(k.to_string()),
-            None => Bson::Null,
-        };
-        let incoming_ts_raw = Self::timestamp_to_i64(&timestamp);
-        let key_filter = key_bson.clone();
-        let filter = doc! {
-            "key": key_filter.clone(),
-            "$or": [
-                { "timestamp_raw": { "$lte": incoming_ts_raw } },
-                { "timestamp_raw": { "$exists": false } }
-            ]
-        };
-        let collection = self.collection.clone();
-        self.append_wal("DELETE", &key, &timestamp, None, None)
-            .await?;
-        let set_doc = doc! {
-            "deleted": true,
-            "timestamp": timestamp.to_string(),
-            "timestamp_raw": incoming_ts_raw,
-        };
-        let update = doc! {
-            "$set": set_doc,
-            "$unset": { "value": "", "value_text": "", "encoding": "" },
-            "$setOnInsert": { "key": key_filter.clone() }
-        };
-        let opts = UpdateOptions::builder().upsert(true).build();
-        let result = self
-            .run_on_runtime(async move { collection.update_one(filter, update, opts).await })
-            .await;
-        match result {
-            Ok(res) if res.upserted_id.is_some() || res.matched_count > 0 => {
-                Ok(StorageInsertionResult::Deleted)
-            }
-            Ok(_) => {
-                // Fallback: fetch current doc and decide based on timestamp.
-                let collection = self.collection.clone();
-                let key_filter = doc! { "key": key_bson };
-                let key_filter_clone = key_filter.clone();
-                let current = self
-                    .run_on_runtime(async move { collection.find_one(key_filter, None).await })
-                    .await?;
-                if let Some(doc) = current {
-                    if let Some(ts_raw) = Self::read_i64_field(&doc, "timestamp_raw") {
-                        if ts_raw > incoming_ts_raw {
-                            return Ok(StorageInsertionResult::Outdated);
+            let key_bson = match key {
+                Some(ref k) => Bson::String(k.to_string()),
+                None => Bson::Null,
+            };
+            let incoming_ts_raw = Self::timestamp_to_i64(&timestamp);
+            let key_filter = key_bson.clone();
+            let filter = doc! {
+                "key": key_filter.clone(),
+                "$or": [
+                    { "timestamp_raw": { "$lte": incoming_ts_raw } },
+                    { "timestamp_raw": { "$exists": false } }
+                ]
+            };
+            let collection = self.collection.clone();
+            self.append_wal("DELETE", &key, &timestamp, None, None)
+                .await?;
+            let set_doc = doc! {
+                "deleted": true,
+                "timestamp": timestamp.to_string(),
+                "timestamp_raw": incoming_ts_raw,
+            };
+            let update = doc! {
+                "$set": set_doc,
+                "$unset": { "value": "", "value_text": "", "encoding": "" },
+                "$setOnInsert": { "key": key_filter.clone() }
+            };
+            let opts = UpdateOptions::builder().upsert(true).build();
+            let result = self
+                .run_on_runtime(async move { collection.update_one(filter, update, opts).await })
+                .await;
+            match result {
+                Ok(res) if res.upserted_id.is_some() || res.matched_count > 0 => {
+                    Ok(StorageInsertionResult::Deleted)
+                }
+                Ok(_) => {
+                    // Fallback: fetch current doc and decide based on timestamp.
+                    let collection = self.collection.clone();
+                    let key_filter = doc! { "key": key_bson };
+                    let key_filter_clone = key_filter.clone();
+                    let current = self
+                        .run_on_runtime(async move { collection.find_one(key_filter, None).await })
+                        .await?;
+                    if let Some(doc) = current {
+                        if let Some(ts_raw) = Self::read_i64_field(&doc, "timestamp_raw") {
+                            if ts_raw > incoming_ts_raw {
+                                return Ok(StorageInsertionResult::Outdated);
+                            }
                         }
                     }
-                }
-                // Either no document or not newer: force tombstone without timestamp gating.
-                let collection = self.collection.clone();
-                let update = doc! {
-                    "$set": {
-                        "deleted": true,
-                        "timestamp": timestamp.to_string(),
-                        "timestamp_raw": incoming_ts_raw,
-                    },
-                    "$unset": { "value": "", "value_text": "", "encoding": "" },
-                    "$setOnInsert": { "key": key_filter_clone.clone() }
-                };
-                self.run_on_runtime(async move {
-                    collection
-                        .update_one(doc! { "key": key_filter_clone }, update, UpdateOptions::builder().upsert(true).build())
-                        .await
-                })
-                .await?;
-                Ok(StorageInsertionResult::Deleted)
-            }
-            Err(e) if format!("{e}").contains("E11000") => {
-                // Duplicate key: there is already a doc for this key. Decide by timestamp then force tombstone.
-                let collection = self.collection.clone();
-                let key_doc = doc! { "key": key_bson.clone() };
-                let existing = self
-                    .run_on_runtime(async move { collection.find_one(key_doc, None).await })
+                    // Either no document or not newer: force tombstone without timestamp gating.
+                    let collection = self.collection.clone();
+                    let update = doc! {
+                        "$set": {
+                            "deleted": true,
+                            "timestamp": timestamp.to_string(),
+                            "timestamp_raw": incoming_ts_raw,
+                        },
+                        "$unset": { "value": "", "value_text": "", "encoding": "" },
+                        "$setOnInsert": { "key": key_filter_clone.clone() }
+                    };
+                    self.run_on_runtime(async move {
+                        collection
+                            .update_one(doc! { "key": key_filter_clone }, update, UpdateOptions::builder().upsert(true).build())
+                            .await
+                    })
                     .await?;
-                if let Some(doc) = existing {
-                    if let Some(ts_raw) = Self::read_i64_field(&doc, "timestamp_raw") {
-                        if ts_raw > incoming_ts_raw {
-                            return Ok(StorageInsertionResult::Outdated);
+                    Ok(StorageInsertionResult::Deleted)
+                }
+                Err(e) if format!("{e}").contains("E11000") => {
+                    // Duplicate key: there is already a doc for this key. Decide by timestamp then force tombstone.
+                    let collection = self.collection.clone();
+                    let key_doc = doc! { "key": key_bson.clone() };
+                    let existing = self
+                        .run_on_runtime(async move { collection.find_one(key_doc, None).await })
+                        .await?;
+                    if let Some(doc) = existing {
+                        if let Some(ts_raw) = Self::read_i64_field(&doc, "timestamp_raw") {
+                            if ts_raw > incoming_ts_raw {
+                                return Ok(StorageInsertionResult::Outdated);
+                            }
                         }
                     }
+                    let collection = self.collection.clone();
+                    let key_filter = doc! { "key": key_bson };
+                    let update = doc! {
+                        "$set": {
+                            "deleted": true,
+                            "timestamp": timestamp.to_string(),
+                            "timestamp_raw": incoming_ts_raw,
+                        },
+                        "$unset": { "value": "", "value_text": "", "encoding": "" },
+                        "$setOnInsert": { "key": key_filter.clone() }
+                    };
+                    self.run_on_runtime(async move {
+                        collection
+                            .update_one(key_filter, update, UpdateOptions::builder().upsert(true).build())
+                            .await
+                    })
+                    .await?;
+                    Ok(StorageInsertionResult::Deleted)
                 }
-                let collection = self.collection.clone();
-                let key_filter = doc! { "key": key_bson };
-                let update = doc! {
-                    "$set": {
-                        "deleted": true,
-                        "timestamp": timestamp.to_string(),
-                        "timestamp_raw": incoming_ts_raw,
-                    },
-                    "$unset": { "value": "", "value_text": "", "encoding": "" },
-                    "$setOnInsert": { "key": key_filter.clone() }
-                };
-                self.run_on_runtime(async move {
-                    collection
-                        .update_one(key_filter, update, UpdateOptions::builder().upsert(true).build())
-                        .await
-                })
-                .await?;
-                Ok(StorageInsertionResult::Deleted)
+                Err(e) => Err(format!("MongoDB DELETE failed: {e}").into()),
             }
-            Err(e) => Err(format!("MongoDB DELETE failed: {e}").into()),
         }
+        .await;
+        if res.is_err() {
+            inc_error();
+        }
+        res
     }
 
     async fn get_all_entries(&self) -> ZResult<Vec<(Option<OwnedKeyExpr>, Timestamp)>> {
@@ -591,4 +616,3 @@ impl Storage for MongoDbStorage {
             .collect()
     }
 }
-
